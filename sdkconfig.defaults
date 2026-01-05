@@ -1,6 +1,17 @@
 # Rust often needs a bit of an extra main task stack size compared to C (the default is 3K)
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8000
 
+# std::thread uses pthread tasks; raise default stack to avoid overflow
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
+
+# Route logs to USB Serial/JTAG so UART0 can be used for reader comms
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+CONFIG_ESP_CONSOLE_UART_CUSTOM=n
+CONFIG_ESP_CONSOLE_USB_CDC=n
+CONFIG_ESP_CONSOLE_NONE=n
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
 # Use this to set FreeRTOS kernel tick frequency to 1000 Hz (100 Hz by default).
 # This allows to use 1 ms granularity for thread sleeps (10 ms by default).
 #CONFIG_FREERTOS_HZ=1000
