@@ -1,5 +1,5 @@
 [package]
-name = "tap-transit-idf-gateway"
+name = "TapTransit-gateway"
 version = "0.1.0"
 authors = ["martin-cao <martincao119@icloud.com>"]
 edition = "2021"
@@ -7,7 +7,7 @@ resolver = "2"
 rust-version = "1.77"
 
 [[bin]]
-name = "tap-transit-idf-gateway"
+name = "TapTransit-gateway"
 harness = false # do not use the built-in cargo test harness -> resolve rust-analyzer errors
 
 [profile.release]
@@ -29,6 +29,7 @@ esp-idf-hal = { version = "0.45", features = ["rmt-legacy"] }
 embedded-svc = "0.28"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+smart-leds = "0.4.0"
 
 [build-dependencies]
 embuild = "0.33"

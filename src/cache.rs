@@ -33,6 +33,10 @@ impl TapEventCache {
         let take = core::cmp::min(limit, self.events.len());
         self.events.drain(0..take).collect()
     }
+
+    pub fn clear(&mut self) {
+        self.events.clear();
+    }
 }
 
 pub struct ConfigCache {

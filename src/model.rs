@@ -138,6 +138,16 @@ pub struct StationConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct FareRule {
+    pub base_price: f32,
+    pub fare_type: Option<String>,
+    pub segment_count: Option<u16>,
+    pub extra_price: Option<f32>,
+    pub start_station: Option<u16>,
+    pub end_station: Option<u16>,
+}
+
+#[derive(Clone, Debug)]
 pub struct RouteConfig {
     pub route_id: u16,
     pub route_name: String,
@@ -145,6 +155,7 @@ pub struct RouteConfig {
     pub tap_mode: TapMode,
     pub max_fare: Option<f32>,
     pub stations: Vec<StationConfig>,
+    pub fares: Vec<FareRule>,
 }
 
 #[derive(Clone, Debug)]
@@ -236,6 +247,23 @@ impl UploadRecord {
 
 fn format_time(epoch_secs: u64) -> String {
     epoch_secs.to_string()
+}
+
+impl RouteConfig {
+    pub fn standard_fare(&self) -> Option<f32> {
+        let mut best: Option<f32> = None;
+        for fare in &self.fares {
+            let base = fare.base_price;
+            if base <= 0.0 {
+                continue;
+            }
+            best = Some(match best {
+                Some(current) => current.min(base),
+                None => base,
+            });
+        }
+        best
+    }
 }
 
 impl fmt::Display for TapEvent {

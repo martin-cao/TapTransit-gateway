@@ -1,9 +1,11 @@
 use std::sync::{mpsc::Sender, Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use embedded_svc::http::Method;
 use embedded_svc::io::Write as _;
 use esp_idf_svc::http::server::{Configuration, EspHttpServer};
 use esp_idf_svc::io::EspIOError;
+use serde_json::json;
 
 use crate::net::NetCommand;
 use crate::model::{FareType, TapMode};
@@ -27,6 +29,44 @@ pub fn start_server(
             .map(|_| ())
     })?;
 
+    let state_status = state.clone();
+    server.fn_handler("/status", Method::Get, move |req| {
+        let status = status_from_state(&state_status);
+        let direction_label = match status.direction {
+            crate::model::Direction::Up => "上行",
+            crate::model::Direction::Down => "下行",
+        };
+        let tone_class = status.passenger_tone.css_class();
+        let tone_label = status.passenger_tone.label();
+        let payload = json!({
+            "route_id": status.route_id,
+            "route_name": status.route_name,
+            "station_id": status.station_id,
+            "station_name": status.station_name,
+            "direction": direction_label,
+            "tap_mode_label": status.tap_mode_label,
+            "fare_type_label": status.fare_type_label,
+            "cache_count": status.cache_count,
+            "wifi_connected": status.wifi_connected,
+            "backend_reachable": status.backend_reachable,
+            "backend_base_url": status.backend_base_url,
+            "passenger": {
+                "tone_class": tone_class,
+                "tone_label": tone_label,
+                "message": status.passenger_message,
+            },
+            "fare": {
+                "standard": status.standard_fare,
+                "actual": status.last_fare,
+                "label": status.last_fare_label,
+            }
+        });
+        let body = payload.to_string();
+        req.into_response(200, Some("OK"), &[("content-type", "application/json")])?
+            .write_all(body.as_bytes())
+            .map(|_| ())
+    })?;
+
     let state_action = state.clone();
     let net_cmd_action = net_cmd_tx.clone();
     server.fn_handler("/action", Method::Get, move |req| {
@@ -35,9 +75,8 @@ pub fn start_server(
                 apply_action(&state_action, &net_cmd_action, action);
             }
         }
-        let status = status_from_state(&state_action);
-        req.into_response(200, Some("OK"), &[("content-type", "text/html; charset=utf-8")])?
-            .write_all(render_index(&status).as_bytes())
+        req.into_response(303, Some("See Other"), &[("Location", "/")])?
+            .write_all(b"")
             .map(|_| ())
     })?;
 
@@ -62,16 +101,19 @@ fn apply_action(state: &Arc<Mutex<GatewayState>>, net_cmd_tx: &Sender<NetCommand
             if let Ok(mut state) = state.lock() {
                 let _ = state.set_station_by_id(station_id);
             }
+            let _ = net_cmd_tx.send(NetCommand::UploadNow);
         }
         DriverAction::NextStation => {
             if let Ok(mut state) = state.lock() {
                 let _ = state.step_station(true);
             }
+            let _ = net_cmd_tx.send(NetCommand::UploadNow);
         }
         DriverAction::PrevStation => {
             if let Ok(mut state) = state.lock() {
                 let _ = state.step_station(false);
             }
+            let _ = net_cmd_tx.send(NetCommand::UploadNow);
         }
         DriverAction::SyncConfig => {
             let route_id = state
@@ -94,7 +136,17 @@ fn apply_action(state: &Arc<Mutex<GatewayState>>, net_cmd_tx: &Sender<NetCommand
 }
 
 fn status_from_state(state: &Arc<Mutex<GatewayState>>) -> StatusPanel {
-    if let Ok(state) = state.lock() {
+    if let Ok(mut state) = state.lock() {
+        let now_ms = current_epoch_millis();
+        if state.last_message_deadline_ms > 0 && now_ms >= state.last_message_deadline_ms {
+            state.last_message_deadline_ms = 0;
+            state.last_passenger_tone = crate::model::PassengerTone::Normal;
+            state.last_passenger_message = "等待刷卡".to_string();
+            state.last_fare_base = None;
+            state.last_fare = None;
+            state.last_fare_label = "应付".to_string();
+            state.last_tap_type = None;
+        }
         let mut route_name = String::new();
         let mut tap_mode_label = "未同步".to_string();
         let mut fare_type_label = "未同步".to_string();
@@ -162,4 +214,11 @@ fn normalize_backend_url(input: String) -> String {
         url = format!("http://{}", url);
     }
     url.trim_end_matches('/').to_string()
+}
+
+fn current_epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }

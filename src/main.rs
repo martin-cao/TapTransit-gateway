@@ -12,6 +12,7 @@ mod upload;
 mod web;
 mod web_server;
 mod uart_link;
+mod smart_led;
 
 use std::sync::{mpsc, Arc, Mutex};
 
@@ -32,6 +33,7 @@ fn main() {
     let peripherals = Peripherals::take().unwrap();
     let pins = peripherals.pins;
     let modem = peripherals.modem;
+    let rmt_channel = peripherals.rmt.channel0;
     let uart_config = uart::config::Config::new().baudrate(Hertz(115_200));
     let uart = uart::UartDriver::new(
         peripherals.uart0,
@@ -46,6 +48,7 @@ fn main() {
 
     let settings = model::GatewaySettings::default();
     let state = Arc::new(Mutex::new(state::GatewayState::bootstrap(settings.clone())));
+    smart_led::spawn_led_task(rmt_channel, pins.gpio48, state.clone());
     let pipeline::GatewayChannels {
         card_tx,
         card_rx,

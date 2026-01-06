@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use embedded_svc::http::client::Client as HttpClient;
 use embedded_svc::http::Method;
-use embedded_svc::io::{Read as _, Write as _};
+use embedded_svc::io::Write as _;
 use embedded_svc::wifi::{AuthMethod, ClientConfiguration, Configuration};
 use esp_idf_hal::modem::Modem;
 use esp_idf_hal::sys::EspError;
@@ -19,7 +19,7 @@ use serde::Deserialize;
 
 use crate::api::{BATCH_RECORDS_PATH, CARDS_PATH, CONFIG_PATH};
 use crate::model::{
-    FareType, GatewaySettings, PassengerTone, RouteConfig, StationConfig, TapMode, UploadRecord,
+    FareRule, FareType, GatewaySettings, PassengerTone, RouteConfig, StationConfig, TapMode, UploadRecord,
 };
 use crate::state::GatewayState;
 use crate::upload::BatchUpload;
@@ -41,6 +41,7 @@ pub enum NetError {
     Io(EspIOError),
     Json(serde_json::Error),
     HttpStatus(u16),
+    Api(String),
 }
 
 impl From<EspIOError> for NetError {
@@ -61,15 +62,28 @@ impl From<serde_json::Error> for NetError {
     }
 }
 
+#[derive(Deserialize)]
+struct ApiResponse<T> {
+    success: bool,
+    data: Option<T>,
+    message: Option<String>,
+}
+
 pub fn connect_wifi(modem: Modem) -> Result<BlockingWifi<EspWifi<'static>>, EspError> {
     let sys_loop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take().ok();
     let mut wifi = BlockingWifi::wrap(EspWifi::new(modem, sys_loop.clone(), nvs)?, sys_loop)?;
 
+    let auth_method = if WIFI_PASS.is_empty() {
+        AuthMethod::None
+    } else {
+        AuthMethod::WPA2Personal
+    };
+
     let wifi_configuration: Configuration = Configuration::Client(ClientConfiguration {
         ssid: WIFI_SSID.try_into().unwrap(),
         bssid: None,
-        auth_method: AuthMethod::WPA3Personal,
+        auth_method,
         password: WIFI_PASS.try_into().unwrap(),
         channel: None,
         ..Default::default()
@@ -94,6 +108,7 @@ pub fn spawn_network_loop(
     thread::spawn(move || {
         let mut buffer: Vec<UploadRecord> = Vec::with_capacity(settings.batch_size);
         let mut route_id: Option<u16> = None;
+        let mut last_upload = Instant::now();
         let refresh_secs = settings
             .config_ttl_secs
             .min(settings.blacklist_ttl_secs) as u64;
@@ -110,6 +125,9 @@ pub fn spawn_network_loop(
                         }
                     }
                     NetCommand::UploadNow => {
+                        while let Ok(record) = upload_rx.try_recv() {
+                            buffer.push(record);
+                        }
                         if let Err(err) = flush_batch(&state, &mut buffer) {
                             log::warn!("Upload batch failed: {:?}", err);
                         }
@@ -142,9 +160,10 @@ pub fn spawn_network_loop(
                 }
             }
 
-            match upload_rx.recv_timeout(Duration::from_secs(5)) {
+            match upload_rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(record) => {
                     buffer.push(record);
+                    last_upload = Instant::now();
                     if buffer.len() >= settings.batch_size {
                         if let Err(err) = flush_batch(&state, &mut buffer) {
                             log::warn!("Upload batch failed: {:?}", err);
@@ -152,7 +171,7 @@ pub fn spawn_network_loop(
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    if !buffer.is_empty() {
+                    if !buffer.is_empty() && last_upload.elapsed() >= Duration::from_secs(5) {
                         if let Err(err) = flush_batch(&state, &mut buffer) {
                             log::warn!("Upload batch failed: {:?}", err);
                         }
@@ -190,6 +209,9 @@ fn flush_batch(state: &Arc<Mutex<GatewayState>>, buffer: &mut Vec<UploadRecord>)
         return Err(NetError::HttpStatus(status));
     }
     buffer.clear();
+    if let Ok(mut state) = state.lock() {
+        state.tap_cache.clear();
+    }
     update_backend_status(state, true);
     Ok(())
 }
@@ -238,8 +260,14 @@ fn fetch_route_config(base_url: &str, route_id: u16) -> Result<RouteConfig, NetE
     if !(200..300).contains(&status) {
         return Err(NetError::HttpStatus(status));
     }
-    let payload: RouteConfigResponse = serde_json::from_slice(&body)?;
-    Ok(payload.into())
+    let payload: ApiResponse<RouteConfigResponse> = serde_json::from_slice(&body)?;
+    if !payload.success {
+        return Err(NetError::Api(payload.message.unwrap_or_else(|| "request failed".to_string())));
+    }
+    let config = payload
+        .data
+        .ok_or_else(|| NetError::Api("empty config response".to_string()))?;
+    Ok(config.into())
 }
 
 fn fetch_blacklist(base_url: &str) -> Result<Vec<String>, NetError> {
@@ -253,7 +281,11 @@ fn fetch_blacklist(base_url: &str) -> Result<Vec<String>, NetError> {
     if !(200..300).contains(&status) {
         return Err(NetError::HttpStatus(status));
     }
-    let cards: Vec<CardResponse> = serde_json::from_slice(&body)?;
+    let payload: ApiResponse<Vec<CardResponse>> = serde_json::from_slice(&body)?;
+    if !payload.success {
+        return Err(NetError::Api(payload.message.unwrap_or_else(|| "request failed".to_string())));
+    }
+    let cards = payload.data.unwrap_or_default();
     Ok(cards.into_iter().filter_map(|card| card.card_id).collect())
 }
 
@@ -268,10 +300,16 @@ fn fetch_card_profile(base_url: &str, card_id: &str) -> Result<Option<CardProfil
     if !(200..300).contains(&status) {
         return Err(NetError::HttpStatus(status));
     }
-    let cards: Vec<CardResponse> = serde_json::from_slice(&body)?;
+    let payload: ApiResponse<Vec<CardResponse>> = serde_json::from_slice(&body)?;
+    if !payload.success {
+        return Err(NetError::Api(payload.message.unwrap_or_else(|| "request failed".to_string())));
+    }
+    let cards = payload.data.unwrap_or_default();
     Ok(cards.into_iter().next().map(|card| CardProfile {
         card_type: card.card_type,
         status: card.status,
+        discount_rate: card.discount_rate,
+        discount_amount: card.discount_amount,
     }))
 }
 
@@ -310,6 +348,15 @@ fn apply_card_profile(state: &Arc<Mutex<GatewayState>>, card_id: &str, profile: 
         return;
     };
     if let Ok(mut state) = state.lock() {
+        let now_ms = current_epoch_millis();
+        state.update_card_cache(
+            card_id.to_string(),
+            profile.card_type.clone(),
+            profile.status.clone(),
+            profile.discount_rate,
+            profile.discount_amount,
+            now_ms,
+        );
         if state.last_card_id == card_id {
             if tone == PassengerTone::Error {
                 state.last_passenger_tone = tone;
@@ -322,6 +369,13 @@ fn apply_card_profile(state: &Arc<Mutex<GatewayState>>, card_id: &str, profile: 
                 }
             } else {
                 state.update_passenger_tone(tone);
+                if let Some(card_type) = profile.card_type.as_deref() {
+                    state.apply_card_discount_policy(
+                        card_type,
+                        profile.discount_rate,
+                        profile.discount_amount,
+                    );
+                }
             }
         }
     }
@@ -330,6 +384,13 @@ fn apply_card_profile(state: &Arc<Mutex<GatewayState>>, card_id: &str, profile: 
 fn current_epoch() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(duration) => duration.as_secs(),
+        Err(_) => 0,
+    }
+}
+
+fn current_epoch_millis() -> u64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis() as u64,
         Err(_) => 0,
     }
 }
@@ -345,6 +406,8 @@ struct RouteConfigResponse {
     max_fare: Option<f32>,
     #[serde(default)]
     stations: Vec<StationResponse>,
+    #[serde(default)]
+    fares: Vec<FareRuleResponse>,
 }
 
 #[derive(Deserialize)]
@@ -359,6 +422,22 @@ struct StationResponse {
 }
 
 #[derive(Deserialize)]
+struct FareRuleResponse {
+    #[serde(default)]
+    base_price: Option<f32>,
+    #[serde(default)]
+    fare_type: Option<String>,
+    #[serde(default)]
+    segment_count: Option<u16>,
+    #[serde(default)]
+    extra_price: Option<f32>,
+    #[serde(default)]
+    start_station: Option<u16>,
+    #[serde(default)]
+    end_station: Option<u16>,
+}
+
+#[derive(Deserialize)]
 struct CardResponse {
     #[serde(default)]
     card_id: Option<String>,
@@ -366,11 +445,17 @@ struct CardResponse {
     card_type: Option<String>,
     #[serde(default)]
     status: Option<String>,
+    #[serde(default)]
+    discount_rate: Option<f32>,
+    #[serde(default)]
+    discount_amount: Option<f32>,
 }
 
 struct CardProfile {
     card_type: Option<String>,
     status: Option<String>,
+    discount_rate: Option<f32>,
+    discount_amount: Option<f32>,
 }
 
 fn tone_from_profile(profile: &CardProfile) -> Option<PassengerTone> {
@@ -399,6 +484,18 @@ impl From<RouteConfigResponse> for RouteConfig {
             Some("tap_in_out") => TapMode::TapInOut,
             _ => TapMode::SingleTap,
         };
+        let fares = value
+            .fares
+            .into_iter()
+            .map(|fare| FareRule {
+                base_price: fare.base_price.unwrap_or(0.0),
+                fare_type: fare.fare_type,
+                segment_count: fare.segment_count,
+                extra_price: fare.extra_price,
+                start_station: fare.start_station,
+                end_station: fare.end_station,
+            })
+            .collect();
         let stations = value
             .stations
             .into_iter()
@@ -417,6 +514,7 @@ impl From<RouteConfigResponse> for RouteConfig {
             tap_mode,
             max_fare: value.max_fare,
             stations,
+            fares,
         }
     }
 }
