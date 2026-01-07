@@ -231,6 +231,7 @@ impl UploadRecord {
             board_time: format_time(event.tap_time),
             alight_time: None,
             board_station_id: Some(event.station_id),
+            // 后端 parseStation 支持 "station_id" 或 "name"；这里发送站点名称（来自后端配置）最稳定。
             board_station: Some(event.station_name.clone()),
             alight_station_id: None,
             alight_station: None,
@@ -245,6 +246,8 @@ impl UploadRecord {
         board_station_id: Option<u16>,
         board_station: Option<String>,
     ) -> Self {
+        // 优先使用站点名称（来自 tap_in 事件），退化时再使用 ID 字符串。
+        let board_station = board_station.or_else(|| board_station_id.map(|id| id.to_string()));
         Self {
             record_id: event.record_id.clone(),
             card_id: event.card_id.clone(),
@@ -258,6 +261,31 @@ impl UploadRecord {
             gateway_id: Some(event.gateway_id.clone()),
         }
     }
+}
+
+/// 卡片状态快照（用于批量校验）。
+#[derive(Clone, Debug, Serialize)]
+pub struct CardStateSnapshot {
+    pub card_id: String,
+    pub balance_cents: u32,
+    pub card_status: String,
+    pub entry_station_id: Option<u16>,
+    pub last_route_id: Option<u16>,
+    pub last_direction: Option<String>,
+    pub last_board_station_id: Option<u16>,
+    pub last_alight_station_id: Option<u16>,
+    pub updated_at: u64,
+    pub source: String,
+}
+
+/// 卡片注册上报数据。
+#[derive(Clone, Debug, Serialize)]
+pub struct CardRegistration {
+    pub card_id: String,
+    pub balance_cents: u32,
+    pub status: String,
+    pub registered_at: u64,
+    pub gateway_id: String,
 }
 
 /// 将 epoch 秒转换为字符串（后端接受 string 时间）。

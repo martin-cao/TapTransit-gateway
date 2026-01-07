@@ -1,13 +1,41 @@
-use crate::cache::{ActiveTripCache, BlacklistCache, ConfigCache, TapDebounce, TapEventCache};
-use crate::model::{
-    Direction, GatewaySettings, PassengerTone, RouteConfig, TapEvent, TapMode, TapType, UploadRecord,
+use crate::cache::{
+    ActiveTripCache, BlacklistCache, CardStateSnapshotCache, ConfigCache, TapDebounce, TapEventCache,
 };
-use crate::serial::{CardAck, CardDetected};
+use crate::card_data::{decode_uid_hex, CardData, CardStatus, CARD_DATA_BLOCK_COUNT, CARD_DATA_BLOCK_START, CARD_DATA_LEN};
+use crate::model::{
+    CardRegistration, CardStateSnapshot, Direction, GatewaySettings, PassengerTone, RouteConfig,
+    TapEvent, TapMode, TapType, UploadRecord,
+};
+use crate::serial::{CardAck, CardDetected, CardWriteRequest, CardWriteResult};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // 卡片缓存过期时间（10 分钟）。
 const CARD_CACHE_TTL_MS: u64 = 10 * 60 * 1000;
+const RECHARGE_MODE_TTL_MS: u64 = 60 * 1000;
+const REGISTER_MODE_TTL_MS: u64 = 60 * 1000;
+const DEFAULT_REGISTER_BALANCE_CENTS: u32 = 0;
+const MAX_RECHARGE_CENTS: u32 = 20_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteContext {
+    TapIn,
+    TapOut,
+    Recharge,
+    Register,
+    Blacklist,
+}
+
+#[derive(Clone, Debug)]
+pub struct RechargeMode {
+    pub amount_cents: u32,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct RegisterMode {
+    pub expires_at_ms: u64,
+}
 
 /// 卡片缓存的用户画像（票种/状态/优惠）。
 #[derive(Clone, Debug)]
@@ -16,6 +44,7 @@ pub struct CachedCardProfile {
     pub status: Option<String>,
     pub discount_rate: Option<f32>,
     pub discount_amount: Option<f32>,
+    pub balance_cents: Option<u32>,
     pub updated_at_ms: u64,
 }
 
@@ -62,6 +91,10 @@ pub struct GatewayState {
     pub last_fare_label: String,
     pub last_tap_type: Option<TapType>,
     pub card_cache: HashMap<String, CachedCardProfile>,
+    pub card_state_cache: CardStateSnapshotCache,
+    pub recharge_mode: Option<RechargeMode>,
+    pub register_mode: Option<RegisterMode>,
+    last_write_context: Option<WriteContext>,
     record_seq: u32,
 }
 
@@ -70,6 +103,8 @@ pub struct Decision {
     pub ack: CardAck,
     pub event: Option<TapEvent>,
     pub upload_record: Option<UploadRecord>,
+    pub write_request: Option<CardWriteRequest>,
+    pub registration: Option<CardRegistration>,
 }
 
 impl GatewayState {
@@ -83,6 +118,7 @@ impl GatewayState {
         debounce: TapDebounce,
         active_trips: ActiveTripCache,
     ) -> Self {
+        let tap_cache_max = settings.tap_cache_max;
         Self {
             settings,
             route_state,
@@ -104,6 +140,10 @@ impl GatewayState {
             last_fare_label: "应付".to_string(),
             last_tap_type: None,
             card_cache: HashMap::new(),
+            card_state_cache: CardStateSnapshotCache::new(tap_cache_max),
+            recharge_mode: None,
+            register_mode: None,
+            last_write_context: None,
             record_seq: 0,
         }
     }
@@ -186,6 +226,64 @@ impl GatewayState {
         }
     }
 
+    pub fn set_recharge_mode(&mut self, amount_cents: u32, now_ms: u64) {
+        if amount_cents == 0 || amount_cents > MAX_RECHARGE_CENTS {
+            return;
+        }
+        self.register_mode = None;
+        self.recharge_mode = Some(RechargeMode {
+            amount_cents,
+            expires_at_ms: now_ms.saturating_add(RECHARGE_MODE_TTL_MS),
+        });
+    }
+
+    pub fn clear_recharge_mode(&mut self) {
+        self.recharge_mode = None;
+    }
+
+    pub fn set_register_mode(&mut self, now_ms: u64) {
+        self.recharge_mode = None;
+        self.register_mode = Some(RegisterMode {
+            expires_at_ms: now_ms.saturating_add(REGISTER_MODE_TTL_MS),
+        });
+    }
+
+    pub fn clear_register_mode(&mut self) {
+        self.register_mode = None;
+    }
+
+    fn refresh_modes(&mut self, now_ms: u64) {
+        if let Some(mode) = &self.recharge_mode {
+            if now_ms >= mode.expires_at_ms {
+                self.recharge_mode = None;
+            }
+        }
+        if let Some(mode) = &self.register_mode {
+            if now_ms >= mode.expires_at_ms {
+                self.register_mode = None;
+            }
+        }
+    }
+
+    pub fn handle_write_result(&mut self, result: CardWriteResult, now_ms: u64) {
+        let context = self.last_write_context.take();
+        if result.result == 1 {
+            if matches!(context, Some(WriteContext::Recharge)) {
+                self.recharge_mode = None;
+            }
+            return;
+        }
+        let message = match context {
+            Some(WriteContext::Recharge) => "充值写卡失败",
+            Some(WriteContext::Register) => "注册写卡失败",
+            Some(WriteContext::Blacklist) => "冻结写卡失败",
+            _ => "写卡失败",
+        };
+        self.last_passenger_tone = PassengerTone::Error;
+        self.last_passenger_message = message.to_string();
+        self.last_message_deadline_ms = now_ms.saturating_add(2000);
+    }
+
     pub fn set_station_by_id(&mut self, station_id: u16) -> bool {
         // 根据站点 ID 直接跳转
         let Some(cfg) = self.config_cache.route.as_ref() else {
@@ -225,36 +323,69 @@ impl GatewayState {
     }
 
     pub fn handle_card_detected(&mut self, detected: CardDetected, now: u64) -> Decision {
-        // 生成刷卡事件并决定是否上报
         let now_ms = current_epoch_millis();
+        self.refresh_modes(now_ms);
         self.last_tap_nonce = self.last_tap_nonce.wrapping_add(1);
         let card_id = detected.card_id.clone();
         self.last_card_id = card_id.clone();
-        // 防抖：刷卡过快直接拒绝
+
         if !self.debounce.allow(&detected.card_id, now) {
-            self.last_passenger_tone = PassengerTone::Error;
-            self.last_passenger_message = "刷卡过快".to_string();
-            self.last_fare_base = None;
-            self.last_fare = None;
-            self.last_message_deadline_ms = now_ms.saturating_add(1000);
-            return Decision {
-                ack: CardAck::rejected(),
-                event: None,
-                upload_record: None,
-            };
+            return self.reject_card("刷卡过快", now_ms);
+        }
+
+        let uid = decode_uid_hex(&card_id);
+        let mut card_data = if detected.card_data.len() >= CARD_DATA_LEN {
+            CardData::from_bytes(&detected.card_data)
+        } else {
+            None
+        };
+        if let (Some(uid), Some(ref data)) = (uid, card_data.as_ref()) {
+            if data.uid != uid {
+                card_data = None;
+            }
         }
 
         if self.blacklist_cache.is_blocked(&detected.card_id) {
-            self.last_passenger_tone = PassengerTone::Error;
-            self.last_passenger_message = "卡已冻结".to_string();
-            self.last_fare_base = None;
-            self.last_fare = None;
-            self.last_message_deadline_ms = now_ms.saturating_add(1000);
-            return Decision {
-                ack: CardAck::rejected(),
-                event: None,
-                upload_record: None,
-            };
+            return self.reject_blacklisted(&card_id, card_data, now_ms);
+        }
+
+        if self.register_mode.is_some() {
+            return self.handle_register(card_id, uid, card_data, now_ms);
+        }
+
+        if self.recharge_mode.is_some() {
+            return self.handle_recharge(card_id, card_data, now_ms);
+        }
+
+        let mut card_data = match card_data {
+            Some(data) => data,
+            None => {
+                // 若读到的卡内数据无效，但后端已存在该卡，则允许按后端余额进行“补全”。
+                // 这能修复“数据库已注册但仍提示未注册”的情况（例如卡片未写入/数据损坏/读错块）。
+                let Some(uid) = uid else {
+                    return self.reject_card("卡未注册", now_ms);
+                };
+                let Some(profile) = self.cached_profile(&card_id, now_ms) else {
+                    return self.reject_card("卡未注册", now_ms);
+                };
+                if let Some(status) = profile.status.as_deref() {
+                    if status == "blocked" {
+                        return self.reject_card("卡已冻结", now_ms);
+                    }
+                    if status == "lost" {
+                        return self.reject_card("卡已挂失", now_ms);
+                    }
+                }
+                let mut data = CardData::new(uid);
+                if let Some(balance_cents) = profile.balance_cents {
+                    data.balance_cents = balance_cents;
+                }
+                data
+            }
+        };
+
+        if card_data.status == CardStatus::Blocked {
+            return self.reject_card("卡已冻结", now_ms);
         }
 
         let tap_mode = self
@@ -265,11 +396,12 @@ impl GatewayState {
             .unwrap_or(TapMode::SingleTap);
 
         let mut board_event: Option<TapEvent> = None;
+        let mut removed_trip: Option<TapEvent> = None;
         let tap_type = match tap_mode {
             TapMode::SingleTap => TapType::TapIn,
             TapMode::TapInOut => {
-                // 进出站：若存在未完成行程则判定为下车
                 if let Some(prev) = self.active_trips.take(&card_id, now) {
+                    removed_trip = Some(prev.clone());
                     board_event = Some(prev);
                     TapType::TapOut
                 } else {
@@ -290,28 +422,42 @@ impl GatewayState {
             self.settings.gateway_id.clone(),
         );
 
+        self.last_passenger_tone = PassengerTone::Normal;
         let mut upload_record = None;
+        let mut write_request = None;
         let standard_fare = self.standard_fare();
         match (tap_mode, tap_type) {
             (TapMode::SingleTap, TapType::TapIn) => {
-                // 单次刷卡：上车即上报
                 upload_record = Some(UploadRecord::from_tap_in(&event));
                 self.last_fare_base = standard_fare;
                 self.last_fare = standard_fare;
                 self.last_fare_label = "应付".to_string();
+                self.apply_cached_profile(&card_id, now_ms);
+                let fare_cents = self.fare_to_cents();
+                if !self.apply_balance(&mut card_data, fare_cents) {
+                    return self.reject_card("余额不足", now_ms);
+                }
+                self.update_last_trip(&mut card_data, None, Some(event.station_id));
+                card_data.status = CardStatus::Idle;
+                card_data.entry_station_id = None;
+                write_request = Some(self.build_write_request(&card_id, &card_data, WriteContext::TapIn));
+                self.push_card_snapshot(&card_id, &card_data, "tap_in", now_ms);
             }
             (TapMode::TapInOut, TapType::TapIn) => {
-                // 进站：先缓存行程
                 self.active_trips.insert(event.clone(), now);
                 upload_record = Some(UploadRecord::from_tap_in(&event));
                 let fare = self.estimate_trip_fare(event.station_id, event.station_id);
                 self.last_fare_base = fare.or(standard_fare);
                 self.last_fare = fare.or(standard_fare);
                 self.last_fare_label = "起步价".to_string();
+                self.apply_cached_profile(&card_id, now_ms);
+                card_data.status = CardStatus::InTrip;
+                card_data.entry_station_id = Some(event.station_id);
+                write_request = Some(self.build_write_request(&card_id, &card_data, WriteContext::TapIn));
+                self.push_card_snapshot(&card_id, &card_data, "tap_in", now_ms);
             }
             (TapMode::TapInOut, TapType::TapOut) => {
-                // 出站：合并行程并估算价格
-                if let Some(board) = board_event {
+                if let Some(board) = board_event.as_ref() {
                     upload_record = Some(UploadRecord::from_tap_out(
                         &event,
                         board.tap_time,
@@ -328,22 +474,233 @@ impl GatewayState {
                     self.last_fare = standard_fare;
                 }
                 self.last_fare_label = "结算价".to_string();
+                self.apply_cached_profile(&card_id, now_ms);
+                let fare_cents = self.fare_to_cents();
+                if !self.apply_balance(&mut card_data, fare_cents) {
+                    if let Some(prev) = removed_trip {
+                        self.active_trips.insert(prev, now);
+                    }
+                    return self.reject_card("余额不足", now_ms);
+                }
+                let board_station = board_event.as_ref().map(|e| e.station_id);
+                self.update_last_trip(&mut card_data, board_station, Some(event.station_id));
+                card_data.status = CardStatus::Idle;
+                card_data.entry_station_id = None;
+                write_request = Some(self.build_write_request(&card_id, &card_data, WriteContext::TapOut));
+                self.push_card_snapshot(&card_id, &card_data, "tap_out", now_ms);
             }
             _ => {}
         }
         self.last_tap_type = Some(tap_type);
 
-        // 默认成功提示
-        self.last_passenger_tone = PassengerTone::Normal;
+        if self.last_passenger_tone != PassengerTone::Error {
         self.last_passenger_message = "刷卡成功".to_string();
+        }
         self.last_message_deadline_ms = now_ms.saturating_add(1000);
-        self.apply_cached_profile(&card_id, now_ms);
 
         Decision {
             ack: CardAck::accepted(),
             event: Some(event),
             upload_record,
+            write_request,
+            registration: None,
         }
+    }
+
+    fn handle_register(
+        &mut self,
+        card_id: String,
+        uid: Option<[u8; 4]>,
+        card_data: Option<CardData>,
+        now_ms: u64,
+    ) -> Decision {
+        let uid = match uid {
+            Some(uid) => uid,
+            None => return self.reject_card("卡号异常", now_ms),
+        };
+        if card_data.is_some() {
+            return self.reject_card("卡已注册", now_ms);
+        }
+
+        let mut new_data = CardData::new(uid);
+        new_data.balance_cents = DEFAULT_REGISTER_BALANCE_CENTS;
+        new_data.status = CardStatus::Idle;
+        let write_request = self.build_write_request(&card_id, &new_data, WriteContext::Register);
+        let registration = CardRegistration {
+            card_id: card_id.clone(),
+            balance_cents: new_data.balance_cents,
+            status: "active".to_string(),
+            registered_at: now_ms,
+            gateway_id: self.settings.gateway_id.clone(),
+        };
+        self.push_card_snapshot(&card_id, &new_data, "register", now_ms);
+        self.last_passenger_tone = PassengerTone::Normal;
+        self.last_passenger_message = "注册成功".to_string();
+        self.last_message_deadline_ms = now_ms.saturating_add(2000);
+        Decision {
+            ack: CardAck::accepted(),
+            event: None,
+            upload_record: None,
+            write_request: Some(write_request),
+            registration: Some(registration),
+        }
+    }
+
+    fn handle_recharge(
+        &mut self,
+        card_id: String,
+        card_data: Option<CardData>,
+        now_ms: u64,
+    ) -> Decision {
+        let Some(mode) = self.recharge_mode.clone() else {
+            return self.reject_card("充值模式已结束", now_ms);
+        };
+        let mut card_data = match card_data {
+            Some(data) => data,
+            None => {
+                // 充值时也允许使用后端已注册卡的余额进行补全，避免“已注册但无法充值”。
+                let Some(uid) = decode_uid_hex(&card_id) else {
+                    return self.reject_card("卡未注册", now_ms);
+                };
+                let Some(profile) = self.cached_profile(&card_id, now_ms) else {
+                    return self.reject_card("卡未注册", now_ms);
+                };
+                if let Some(status) = profile.status.as_deref() {
+                    if status == "blocked" {
+                        return self.reject_card("卡已冻结", now_ms);
+                    }
+                    if status == "lost" {
+                        return self.reject_card("卡已挂失", now_ms);
+                    }
+                }
+                let mut data = CardData::new(uid);
+                if let Some(balance_cents) = profile.balance_cents {
+                    data.balance_cents = balance_cents;
+                }
+                data
+            }
+        };
+        if card_data.status != CardStatus::Idle {
+            return self.reject_card("卡状态异常", now_ms);
+        }
+        card_data.balance_cents = card_data.balance_cents.saturating_add(mode.amount_cents);
+        let write_request = self.build_write_request(&card_id, &card_data, WriteContext::Recharge);
+        self.push_card_snapshot(&card_id, &card_data, "recharge", now_ms);
+        self.last_passenger_tone = PassengerTone::Normal;
+        self.last_passenger_message = "充值成功".to_string();
+        self.last_message_deadline_ms = now_ms.saturating_add(2000);
+        Decision {
+            ack: CardAck::accepted(),
+            event: None,
+            upload_record: None,
+            write_request: Some(write_request),
+            registration: None,
+        }
+    }
+
+    fn reject_card(&mut self, message: &str, now_ms: u64) -> Decision {
+        self.reject_with_write(message, None, now_ms)
+    }
+
+    fn reject_with_write(
+        &mut self,
+        message: &str,
+        write_request: Option<CardWriteRequest>,
+        now_ms: u64,
+    ) -> Decision {
+        self.last_passenger_tone = PassengerTone::Error;
+        self.last_passenger_message = message.to_string();
+        self.last_fare_base = None;
+        self.last_fare = None;
+        self.last_message_deadline_ms = now_ms.saturating_add(1000);
+        Decision {
+            ack: CardAck::rejected(),
+            event: None,
+            upload_record: None,
+            write_request,
+            registration: None,
+        }
+    }
+
+    fn reject_blacklisted(
+        &mut self,
+        card_id: &str,
+        card_data: Option<CardData>,
+        now_ms: u64,
+    ) -> Decision {
+        let mut write_request = None;
+        if let Some(mut data) = card_data {
+            if data.status != CardStatus::Blocked {
+                data.status = CardStatus::Blocked;
+                data.entry_station_id = None;
+                write_request = Some(self.build_write_request(card_id, &data, WriteContext::Blacklist));
+                self.push_card_snapshot(card_id, &data, "blacklist", now_ms);
+            }
+        }
+        self.reject_with_write("卡已冻结", write_request, now_ms)
+    }
+
+    fn fare_to_cents(&self) -> u32 {
+        self.last_fare
+            .or(self.last_fare_base)
+            .map(|fare| (fare * 100.0).round().max(0.0) as u32)
+            .unwrap_or(0)
+    }
+
+    fn apply_balance(&mut self, card_data: &mut CardData, fare_cents: u32) -> bool {
+        if fare_cents == 0 {
+            return true;
+        }
+        if card_data.balance_cents < fare_cents {
+            return false;
+        }
+        card_data.balance_cents = card_data.balance_cents.saturating_sub(fare_cents);
+        true
+    }
+
+    fn update_last_trip(
+        &self,
+        card_data: &mut CardData,
+        board_station_id: Option<u16>,
+        alight_station_id: Option<u16>,
+    ) {
+        card_data.last_route_id = Some(self.route_state.route_id);
+        card_data.last_direction = Some(self.route_state.direction);
+        card_data.last_board_station_id = board_station_id;
+        card_data.last_alight_station_id = alight_station_id;
+    }
+
+    fn build_write_request(
+        &mut self,
+        card_id: &str,
+        card_data: &CardData,
+        context: WriteContext,
+    ) -> CardWriteRequest {
+        self.last_write_context = Some(context);
+        CardWriteRequest {
+            card_id: card_id.to_string(),
+            card_data: card_data.to_bytes().to_vec(),
+            block_start: CARD_DATA_BLOCK_START,
+            block_count: CARD_DATA_BLOCK_COUNT,
+        }
+    }
+
+    fn push_card_snapshot(&mut self, card_id: &str, card_data: &CardData, source: &str, now_ms: u64) {
+        let snapshot = CardStateSnapshot {
+            card_id: card_id.to_string(),
+            balance_cents: card_data.balance_cents,
+            card_status: card_data.status.as_str().to_string(),
+            entry_station_id: card_data.entry_station_id,
+            last_route_id: card_data.last_route_id,
+            last_direction: card_data
+                .last_direction
+                .map(|direction| direction.as_str().to_string()),
+            last_board_station_id: card_data.last_board_station_id,
+            last_alight_station_id: card_data.last_alight_station_id,
+            updated_at: now_ms,
+            source: source.to_string(),
+        };
+        let _ = self.card_state_cache.push(snapshot);
     }
 
     /// 根据 UI/后端反馈更新提示音色。
@@ -441,6 +798,7 @@ impl GatewayState {
         status: Option<String>,
         discount_rate: Option<f32>,
         discount_amount: Option<f32>,
+        balance_cents: Option<u32>,
         now_ms: u64,
     ) {
         if self.card_cache.len() >= 256 && !self.card_cache.contains_key(&card_id) {
@@ -460,9 +818,20 @@ impl GatewayState {
                 status,
                 discount_rate,
                 discount_amount,
+                balance_cents,
                 updated_at_ms: now_ms,
             },
         );
+    }
+
+    fn cached_profile(&self, card_id: &str, now_ms: u64) -> Option<CachedCardProfile> {
+        let Some(profile) = self.card_cache.get(card_id).cloned() else {
+            return None;
+        };
+        if now_ms.saturating_sub(profile.updated_at_ms) > CARD_CACHE_TTL_MS {
+            return None;
+        }
+        Some(profile)
     }
 
     pub fn apply_cached_profile(&mut self, card_id: &str, now_ms: u64) {

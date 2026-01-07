@@ -1,5 +1,8 @@
 use crate::proto::{decode_frame, encode_frame, Frame, FrameError, FRAME_HEADER, FRAME_VERSION};
-use crate::serial::{card_detected_from_frame, CardAck, CardDetected};
+use crate::serial::{
+    card_detected_from_frame, card_write_result_from_frame, CardAck, CardDetected, CardWriteRequest,
+    CardWriteResult,
+};
 use std::sync::mpsc::Sender;
 
 /// 帧读取器：逐字节组装完整帧。
@@ -68,12 +71,12 @@ pub fn frame_to_bytes(frame: &Frame) -> Vec<u8> {
     encode_frame(frame)
 }
 
-/// 针对刷卡事件的帧解码器。
-pub struct CardFrameCodec {
+/// 串口帧解码器（刷卡事件 + 写卡结果）。
+pub struct SerialFrameCodec {
     reader: FrameReader,
 }
 
-impl CardFrameCodec {
+impl SerialFrameCodec {
     /// 创建解码器。
     pub fn new() -> Self {
         Self {
@@ -81,14 +84,19 @@ impl CardFrameCodec {
         }
     }
 
-    /// 推入一个字节并尝试解析为 CardDetected。
-    pub fn push_byte(&mut self, byte: u8) -> Option<Result<CardDetected, FrameError>> {
+    /// 推入一个字节并尝试解析为事件。
+    pub fn push_byte(&mut self, byte: u8) -> Option<Result<SerialEvent, FrameError>> {
         let result = self.reader.push(byte)?;
         match result {
-            Ok(frame) => match card_detected_from_frame(&frame) {
-                Some(event) => Some(Ok(event)),
-                None => Some(Err(FrameError::BadLength)),
-            },
+            Ok(frame) => {
+                if let Some(event) = card_detected_from_frame(&frame) {
+                    return Some(Ok(SerialEvent::CardDetected(event)));
+                }
+                if let Some(result) = card_write_result_from_frame(&frame) {
+                    return Some(Ok(SerialEvent::CardWriteResult(result)));
+                }
+                Some(Err(FrameError::BadLength))
+            }
             Err(err) => Some(Err(err)),
         }
     }
@@ -97,17 +105,36 @@ impl CardFrameCodec {
     pub fn ack_to_bytes(ack: &CardAck) -> Vec<u8> {
         frame_to_bytes(&ack.to_frame())
     }
+
+    /// 将写卡请求编码为字节序列。
+    pub fn write_req_to_bytes(req: &CardWriteRequest) -> Vec<u8> {
+        frame_to_bytes(&req.to_frame())
+    }
 }
 
-/// 逐字节喂给解码器，解析出卡片事件并发送到通道。
+/// 串口事件类型。
+pub enum SerialEvent {
+    CardDetected(CardDetected),
+    CardWriteResult(CardWriteResult),
+}
+
+/// 逐字节喂给解码器，解析出事件并发送到通道。
 pub fn push_bytes_to_channel(
-    codec: &mut CardFrameCodec,
+    codec: &mut SerialFrameCodec,
     bytes: &[u8],
     card_tx: &Sender<CardDetected>,
+    write_result_tx: &Sender<CardWriteResult>,
 ) {
     for &byte in bytes {
-        if let Some(Ok(card)) = codec.push_byte(byte) {
-            let _ = card_tx.send(card);
+        if let Some(Ok(event)) = codec.push_byte(byte) {
+            match event {
+                SerialEvent::CardDetected(card) => {
+                    let _ = card_tx.send(card);
+                }
+                SerialEvent::CardWriteResult(result) => {
+                    let _ = write_result_tx.send(result);
+                }
+            }
         }
     }
 }

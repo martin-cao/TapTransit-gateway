@@ -62,7 +62,10 @@ pub fn start_server(
                 "standard": status.standard_fare,
                 "actual": status.last_fare,
                 "label": status.last_fare_label,
-            }
+            },
+            "recharge_active": status.recharge_active,
+            "recharge_amount_cents": status.recharge_amount_cents,
+            "register_active": status.register_active,
         });
         let body = payload.to_string();
         req.into_response(200, Some("OK"), &[("content-type", "application/json")])?
@@ -137,6 +140,28 @@ fn apply_action(state: &Arc<Mutex<GatewayState>>, net_cmd_tx: &Sender<NetCommand
             }
             let _ = net_cmd_tx.send(NetCommand::SetBackend { base_url: normalized });
         }
+        DriverAction::StartRecharge { amount_cents } => {
+            let now_ms = current_epoch_millis();
+            if let Ok(mut state) = state.lock() {
+                state.set_recharge_mode(amount_cents, now_ms);
+            }
+        }
+        DriverAction::CancelRecharge => {
+            if let Ok(mut state) = state.lock() {
+                state.clear_recharge_mode();
+            }
+        }
+        DriverAction::StartRegister => {
+            let now_ms = current_epoch_millis();
+            if let Ok(mut state) = state.lock() {
+                state.set_register_mode(now_ms);
+            }
+        }
+        DriverAction::CancelRegister => {
+            if let Ok(mut state) = state.lock() {
+                state.clear_register_mode();
+            }
+        }
     }
 }
 
@@ -189,6 +214,9 @@ fn status_from_state(state: &Arc<Mutex<GatewayState>>) -> StatusPanel {
             standard_fare: state.standard_fare(),
             last_fare: state.last_fare,
             last_fare_label: state.last_fare_label.clone(),
+            recharge_active: state.recharge_mode.is_some(),
+            recharge_amount_cents: state.recharge_mode.as_ref().map(|mode| mode.amount_cents),
+            register_active: state.register_mode.is_some(),
         }
     } else {
         // 无法获取锁时返回默认状态
@@ -209,6 +237,9 @@ fn status_from_state(state: &Arc<Mutex<GatewayState>>) -> StatusPanel {
             standard_fare: None,
             last_fare: None,
             last_fare_label: "应付".to_string(),
+            recharge_active: false,
+            recharge_amount_cents: None,
+            register_active: false,
         }
     }
 }

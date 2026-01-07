@@ -9,6 +9,10 @@ pub enum DriverAction {
     SyncConfig,
     UploadNow,
     SetBackend { base_url: String },
+    StartRecharge { amount_cents: u32 },
+    CancelRecharge,
+    StartRegister,
+    CancelRegister,
 }
 
 /// Web UI 展示的状态面板数据。
@@ -30,6 +34,9 @@ pub struct StatusPanel {
     pub standard_fare: Option<f32>,
     pub last_fare: Option<f32>,
     pub last_fare_label: String,
+    pub recharge_active: bool,
+    pub recharge_amount_cents: Option<u32>,
+    pub register_active: bool,
 }
 
 /// 操作结果（预留扩展）。
@@ -49,6 +56,7 @@ pub fn render_index(status: &StatusPanel) -> String {
     let tone_label = status.passenger_tone.label();
     let standard_fare = format_fare(status.standard_fare);
     let actual_fare = format_fare(status.last_fare);
+    let recharge_amount = format_cents(status.recharge_amount_cents);
     let backend_display = if status.backend_base_url.is_empty() {
         "默认"
     } else {
@@ -195,6 +203,14 @@ pub fn render_index(status: &StatusPanel) -> String {
     html.push_str(backend_display);
     html.push_str("</span>");
     html.push_str("</div></div>");
+    html.push_str("<div class=\"driver-card\"><div class=\"sub\">充值模式</div><div class=\"route\" id=\"recharge-status\">");
+    html.push_str(if status.recharge_active { "进行中" } else { "未开启" });
+    html.push_str("</div><div class=\"sub\">金额 <span id=\"recharge-amount\">");
+    html.push_str(&recharge_amount);
+    html.push_str("</span></div></div>");
+    html.push_str("<div class=\"driver-card\"><div class=\"sub\">注册模式</div><div class=\"route\" id=\"register-status\">");
+    html.push_str(if status.register_active { "进行中" } else { "未开启" });
+    html.push_str("</div></div>");
     html.push_str("</div>");
 
     html.push_str("<div class=\"driver-grid\">");
@@ -223,11 +239,29 @@ pub fn render_index(status: &StatusPanel) -> String {
     html.push_str("\">");
     html.push_str("<button type=\"submit\">更新后端</button>");
     html.push_str("</form>");
+    html.push_str("<form action=\"/action\" method=\"get\">");
+    html.push_str("<input type=\"hidden\" name=\"type\" value=\"recharge\">");
+    html.push_str("<input name=\"amount\" type=\"number\" step=\"0.01\" min=\"0\" placeholder=\"充值金额(元)\">");
+    html.push_str("<button type=\"submit\">进入充值模式</button>");
+    html.push_str("</form>");
+    html.push_str("<form action=\"/action\" method=\"get\">");
+    html.push_str("<input type=\"hidden\" name=\"type\" value=\"recharge_off\">");
+    html.push_str("<button type=\"submit\">取消充值模式</button>");
+    html.push_str("</form>");
+    html.push_str("<form action=\"/action\" method=\"get\">");
+    html.push_str("<input type=\"hidden\" name=\"type\" value=\"register_on\">");
+    html.push_str("<button type=\"submit\">进入注册模式</button>");
+    html.push_str("</form>");
+    html.push_str("<form action=\"/action\" method=\"get\">");
+    html.push_str("<input type=\"hidden\" name=\"type\" value=\"register_off\">");
+    html.push_str("<button type=\"submit\">取消注册模式</button>");
+    html.push_str("</form>");
     html.push_str("</section>");
     html.push_str("<script>");
     html.push_str("const toneClasses=['tone-normal','tone-student','tone-elder','tone-disabled','tone-error'];");
     html.push_str("const el=(id)=>document.getElementById(id);");
     html.push_str("function formatFare(v){if(v===null||v===undefined)return '—';return '¥'+Number(v).toFixed(2);}");
+    html.push_str("function formatCents(v){if(v===null||v===undefined)return '—';return '¥'+(Number(v)/100).toFixed(2);}");
     html.push_str("function applyStatus(s){");
     html.push_str("const routeName=s.route_name||'未同步';");
     html.push_str("el('route-line').textContent=`线路 ${s.route_id} · ${routeName} · ${s.direction}`;");
@@ -251,6 +285,9 @@ pub fn render_index(status: &StatusPanel) -> String {
     html.push_str("el('backend-text').textContent=s.backend_reachable?'可达':'不可达';");
     html.push_str("el('backend-dot').className='status-dot '+(s.backend_reachable?'dot-ok':'dot-bad');");
     html.push_str("el('backend-address').textContent=s.backend_base_url||'默认';");
+    html.push_str("el('recharge-status').textContent=s.recharge_active?'进行中':'未开启';");
+    html.push_str("el('recharge-amount').textContent=formatCents(s.recharge_amount_cents);");
+    html.push_str("el('register-status').textContent=s.register_active?'进行中':'未开启';");
     html.push_str("const input=document.activeElement;const backendInput=el('backend-input');");
     html.push_str("if(input!==backendInput){backendInput.value=s.backend_base_url||'';}");
     html.push_str("const screen=el('passenger-screen');toneClasses.forEach(c=>screen.classList.remove(c));");
@@ -294,6 +331,14 @@ pub fn parse_action(query: &str) -> Option<DriverAction> {
                 Some(DriverAction::SetBackend { base_url })
             }
         }
+        "recharge" => {
+            let amount = query_value(query, "amount")?;
+            let amount_cents = parse_amount_cents(&amount)?;
+            Some(DriverAction::StartRecharge { amount_cents })
+        }
+        "recharge_off" => Some(DriverAction::CancelRecharge),
+        "register_on" => Some(DriverAction::StartRegister),
+        "register_off" => Some(DriverAction::CancelRegister),
         _ => None,
     }
 }
@@ -358,4 +403,25 @@ fn format_fare(fare: Option<f32>) -> String {
         Some(amount) => format!("¥{:.2}", amount),
         None => "—".to_string(),
     }
+}
+
+/// 金额（分）格式化为人民币。
+fn format_cents(amount_cents: Option<u32>) -> String {
+    match amount_cents {
+        Some(amount) => format!("¥{:.2}", amount as f64 / 100.0),
+        None => "—".to_string(),
+    }
+}
+
+/// 解析充值金额（元）为分。
+fn parse_amount_cents(input: &str) -> Option<u32> {
+    let value: f64 = input.trim().parse().ok()?;
+    if value <= 0.0 {
+        return None;
+    }
+    let cents = (value * 100.0).round();
+    if cents <= 0.0 || cents > u32::MAX as f64 {
+        return None;
+    }
+    Some(cents as u32)
 }

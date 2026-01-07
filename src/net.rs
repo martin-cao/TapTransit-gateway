@@ -17,9 +17,12 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::{BlockingWifi, EspWifi};
 use serde::Deserialize;
 
-use crate::api::{BATCH_RECORDS_PATH, CARDS_PATH, CONFIG_PATH};
+use crate::api::{
+    BATCH_RECORDS_PATH, CARD_REGISTER_PATH, CARD_STATE_BATCH_PATH, CARDS_PATH, CONFIG_PATH,
+};
 use crate::model::{
-    FareRule, FareType, GatewaySettings, PassengerTone, RouteConfig, StationConfig, TapMode, UploadRecord,
+    CardRegistration, CardStateSnapshot, FareRule, FareType, GatewaySettings, PassengerTone,
+    RouteConfig, StationConfig, TapMode, UploadRecord,
 };
 use crate::state::GatewayState;
 use crate::upload::BatchUpload;
@@ -36,6 +39,7 @@ pub enum NetCommand {
     UploadNow,
     SetBackend { base_url: String },
     LookupCard { card_id: String },
+    RegisterCard { payload: CardRegistration },
 }
 
 /// 网络请求错误类型。
@@ -73,36 +77,66 @@ struct ApiResponse<T> {
     message: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct CardStateBatchResponse {
+    accepted: Option<Vec<String>>,
+    rejected: Option<Vec<CardStateReject>>,
+}
+
+#[derive(Deserialize)]
+struct CardStateReject {
+    card_id: String,
+    reason: Option<String>,
+}
+
 /// 连接 Wi-Fi（阻塞直到联网）。
 pub fn connect_wifi(modem: Modem) -> Result<BlockingWifi<EspWifi<'static>>, EspError> {
     let sys_loop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take().ok();
     let mut wifi = BlockingWifi::wrap(EspWifi::new(modem, sys_loop.clone(), nvs)?, sys_loop)?;
 
-    // 选择认证方式
-    let auth_method = if WIFI_PASS.is_empty() {
-        AuthMethod::None
-    } else {
-        AuthMethod::WPA2Personal
-    };
+    log::info!(
+        "Wi-Fi connecting to SSID='{}' (pass_len={})",
+        WIFI_SSID,
+        WIFI_PASS.len()
+    );
 
-    let wifi_configuration: Configuration = Configuration::Client(ClientConfiguration {
-        ssid: WIFI_SSID.try_into().unwrap(),
-        bssid: None,
-        auth_method,
-        password: WIFI_PASS.try_into().unwrap(),
-        channel: None,
-        ..Default::default()
-    });
+    fn try_connect(
+        wifi: &mut BlockingWifi<EspWifi<'static>>,
+        auth_method: AuthMethod,
+    ) -> Result<(), EspError> {
+        let wifi_configuration: Configuration = Configuration::Client(ClientConfiguration {
+            ssid: WIFI_SSID.try_into().unwrap(),
+            bssid: None,
+            auth_method,
+            password: WIFI_PASS.try_into().unwrap(),
+            channel: None,
+            ..Default::default()
+        });
 
-    // 启动并连接
-    wifi.set_configuration(&wifi_configuration)?;
-    wifi.start()?;
-    log::info!("Wi-Fi started");
-    wifi.connect()?;
-    log::info!("Wi-Fi connected to {}", WIFI_SSID);
-    wifi.wait_netif_up()?;
-    log::info!("Wi-Fi netif up");
+        wifi.set_configuration(&wifi_configuration)?;
+        wifi.start()?;
+        log::info!("Wi-Fi started (auth={:?})", auth_method);
+        wifi.connect()?;
+        log::info!("Wi-Fi connected to {}", WIFI_SSID);
+        wifi.wait_netif_up()?;
+        log::info!("Wi-Fi netif up");
+        Ok(())
+    }
+
+    // 连接策略：
+    // - 无密码：开放网络
+    // - 有密码：默认优先 WPA2（符合常见热点/课堂环境），失败则尝试 WPA2/WPA3 兼容
+    if WIFI_PASS.is_empty() {
+        try_connect(&mut wifi, AuthMethod::None)?;
+        return Ok(wifi);
+    }
+
+    if try_connect(&mut wifi, AuthMethod::WPA2Personal).is_ok() {
+        return Ok(wifi);
+    }
+    log::warn!("Wi-Fi connect retrying with WPA2WPA3Personal...");
+    try_connect(&mut wifi, AuthMethod::WPA2WPA3Personal)?;
     Ok(wifi)
 }
 
@@ -115,8 +149,10 @@ pub fn spawn_network_loop(
     thread::spawn(move || {
         // 上传缓冲区与配置刷新计时
         let mut buffer: Vec<UploadRecord> = Vec::with_capacity(settings.batch_size);
+        let mut card_state_buffer: Vec<CardStateSnapshot> = Vec::with_capacity(settings.batch_size);
         let mut route_id: Option<u16> = None;
         let mut last_upload = Instant::now();
+        let mut last_state_upload = Instant::now();
         let refresh_secs = settings
             .config_ttl_secs
             .min(settings.blacklist_ttl_secs) as u64;
@@ -141,6 +177,9 @@ pub fn spawn_network_loop(
                         if let Err(err) = flush_batch(&state, &mut buffer) {
                             log::warn!("Upload batch failed: {:?}", err);
                         }
+                        if let Err(err) = flush_card_state_batch(&state, &mut card_state_buffer) {
+                            log::warn!("Card state upload failed: {:?}", err);
+                        }
                     }
                     NetCommand::SetBackend { base_url } => {
                         // 切换后端地址
@@ -159,6 +198,12 @@ pub fn spawn_network_loop(
                             Err(err) => {
                                 log::warn!("Card lookup failed: {:?}", err);
                             }
+                        }
+                    }
+                    NetCommand::RegisterCard { payload } => {
+                        let base_url = resolve_base_url(&state);
+                        if let Err(err) = register_card(&base_url, payload) {
+                            log::warn!("Card register failed: {:?}", err);
                         }
                     }
                 }
@@ -194,6 +239,21 @@ pub fn spawn_network_loop(
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
+
+            // 按时间间隔刷新卡片状态快照
+            if last_state_upload.elapsed() >= Duration::from_secs(5) {
+                if let Ok(mut state) = state.lock() {
+                    let drained = state.card_state_cache.drain_batch(settings.batch_size);
+                    card_state_buffer.extend(drained);
+                }
+                if !card_state_buffer.is_empty() {
+                    if let Err(err) = flush_card_state_batch(&state, &mut card_state_buffer) {
+                        log::warn!("Card state upload failed: {:?}", err);
+                    } else {
+                        last_state_upload = Instant::now();
+                    }
+                }
+            }
         }
     })
 }
@@ -228,6 +288,74 @@ fn flush_batch(state: &Arc<Mutex<GatewayState>>, buffer: &mut Vec<UploadRecord>)
     if let Ok(mut state) = state.lock() {
         state.tap_cache.clear();
     }
+    update_backend_status(state, true);
+    Ok(())
+}
+
+/// 上报卡片状态快照批次。
+fn flush_card_state_batch(
+    state: &Arc<Mutex<GatewayState>>,
+    buffer: &mut Vec<CardStateSnapshot>,
+) -> Result<(), NetError> {
+    if buffer.is_empty() {
+        return Ok(());
+    }
+    let payload = serde_json::to_string(&buffer)?;
+    let base_url = resolve_base_url(state);
+    let url = format!("{}{}", base_url, CARD_STATE_BATCH_PATH);
+    let content_length = payload.len().to_string();
+    let headers = [
+        ("content-type", "application/json"),
+        ("content-length", content_length.as_str()),
+    ];
+
+    let mut client = HttpClient::wrap(EspHttpConnection::new(&Default::default())?);
+    let mut request = client.request(Method::Post, &url, &headers)?;
+    request.write_all(payload.as_bytes())?;
+    request.flush()?;
+    let mut response = request.submit()?;
+    let status = response.status();
+    let body = read_response_body(&mut response)?;
+    if !(200..300).contains(&status) {
+        update_backend_status(state, false);
+        return Err(NetError::HttpStatus(status));
+    }
+    let payload: ApiResponse<CardStateBatchResponse> = serde_json::from_slice(&body)?;
+    if !payload.success {
+        return Err(NetError::Api(
+            payload.message.unwrap_or_else(|| "card state upload failed".to_string()),
+        ));
+    }
+    if let Some(result) = payload.data {
+        if let Some(rejected) = result.rejected {
+            // rejected 代表“状态校验失败”，不等价于“应封禁”。
+            // 只在后端明确返回“card blocked”时，才将卡加入黑名单缓存。
+            let mut to_blacklist: Vec<String> = Vec::new();
+            for item in rejected {
+                if matches!(item.reason.as_deref(), Some("card blocked")) {
+                    to_blacklist.push(item.card_id);
+                } else {
+                    log::warn!(
+                        "Card state rejected (not blacklisting): card_id={}, reason={:?}",
+                        item.card_id,
+                        item.reason
+                    );
+                }
+            }
+            if !to_blacklist.is_empty() {
+                let now = current_epoch();
+                if let Ok(mut state) = state.lock() {
+                    for card_id in to_blacklist {
+                        if !state.blacklist_cache.is_blocked(&card_id) {
+                            state.blacklist_cache.cards.push(card_id);
+                        }
+                    }
+                    state.blacklist_cache.fetched_at = now;
+                }
+            }
+        }
+    }
+    buffer.clear();
     update_backend_status(state, true);
     Ok(())
 }
@@ -308,6 +436,34 @@ fn fetch_blacklist(base_url: &str) -> Result<Vec<String>, NetError> {
     Ok(cards.into_iter().filter_map(|card| card.card_id).collect())
 }
 
+/// 上报卡片注册信息。
+fn register_card(base_url: &str, payload: CardRegistration) -> Result<(), NetError> {
+    let url = format!("{}{}", base_url, CARD_REGISTER_PATH);
+    let body = serde_json::to_string(&payload)?;
+    let content_length = body.len().to_string();
+    let headers = [
+        ("content-type", "application/json"),
+        ("content-length", content_length.as_str()),
+    ];
+    let mut client = HttpClient::wrap(EspHttpConnection::new(&Default::default())?);
+    let mut request = client.request(Method::Post, &url, &headers)?;
+    request.write_all(body.as_bytes())?;
+    request.flush()?;
+    let mut response = request.submit()?;
+    let status = response.status();
+    let resp_body = read_response_body(&mut response)?;
+    if !(200..300).contains(&status) {
+        return Err(NetError::HttpStatus(status));
+    }
+    let payload: ApiResponse<serde_json::Value> = serde_json::from_slice(&resp_body)?;
+    if !payload.success {
+        return Err(NetError::Api(
+            payload.message.unwrap_or_else(|| "register failed".to_string()),
+        ));
+    }
+    Ok(())
+}
+
 /// 查询卡片详细信息（票种/状态/折扣）。
 fn fetch_card_profile(base_url: &str, card_id: &str) -> Result<Option<CardProfile>, NetError> {
     let url = format!("{}{}?card_id={}", base_url, CARDS_PATH, card_id);
@@ -328,6 +484,7 @@ fn fetch_card_profile(base_url: &str, card_id: &str) -> Result<Option<CardProfil
     Ok(cards.into_iter().next().map(|card| CardProfile {
         card_type: card.card_type,
         status: card.status,
+        balance_cents: card.balance.map(|value| (value.max(0.0) * 100.0).round() as u32),
         discount_rate: card.discount_rate,
         discount_amount: card.discount_amount,
     }))
@@ -379,6 +536,7 @@ fn apply_card_profile(state: &Arc<Mutex<GatewayState>>, card_id: &str, profile: 
             profile.status.clone(),
             profile.discount_rate,
             profile.discount_amount,
+            profile.balance_cents,
             now_ms,
         );
         if state.last_card_id == card_id {
@@ -473,6 +631,8 @@ struct CardResponse {
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
+    balance: Option<f64>,
+    #[serde(default)]
     discount_rate: Option<f32>,
     #[serde(default)]
     discount_amount: Option<f32>,
@@ -482,6 +642,7 @@ struct CardResponse {
 struct CardProfile {
     card_type: Option<String>,
     status: Option<String>,
+    balance_cents: Option<u32>,
     discount_rate: Option<f32>,
     discount_amount: Option<f32>,
 }

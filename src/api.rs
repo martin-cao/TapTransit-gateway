@@ -8,6 +8,8 @@ pub struct ApiConfig {
 pub const CONFIG_PATH: &str = "/api/v1/bus/config";
 pub const BATCH_RECORDS_PATH: &str = "/api/v1/bus/batchRecords";
 pub const CARDS_PATH: &str = "/api/v1/cards";
+pub const CARD_STATE_BATCH_PATH: &str = "/api/v1/cards/state/batch";
+pub const CARD_REGISTER_PATH: &str = "/api/v1/cards/register";
 
 impl ApiConfig {
     /// 线路配置接口 URL。

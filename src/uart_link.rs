@@ -5,25 +5,26 @@ use std::thread;
 use esp_idf_hal::delay;
 use esp_idf_hal::uart::{UartRxDriver, UartTxDriver};
 
-use crate::serial::{CardAck, CardDetected};
-use crate::serial_io::{push_bytes_to_channel, CardFrameCodec};
+use crate::serial::{CardDetected, CardWriteResult, SerialCommand};
+use crate::serial_io::{push_bytes_to_channel, SerialFrameCodec};
 
 /// 启动 UART 收发任务（RX 解码、TX 发送 ACK）。
 pub fn spawn_uart_tasks(
     rx: UartRxDriver<'static>,
     mut tx: UartTxDriver<'static>,
     card_tx: Sender<CardDetected>,
-    ack_rx: Receiver<CardAck>,
+    write_result_tx: Sender<CardWriteResult>,
+    cmd_rx: Receiver<SerialCommand>,
 ) -> (thread::JoinHandle<()>, thread::JoinHandle<()>) {
     let rx_handle = thread::spawn(move || {
-        let mut codec = CardFrameCodec::new();
+        let mut codec = SerialFrameCodec::new();
         let mut buf = [0u8; 128];
         loop {
             match rx.read(&mut buf, delay::BLOCK) {
                 Ok(count) if count > 0 => {
                     // 收到数据后写入帧解码器
                     log_bytes("UART RX:", &buf[..count]);
-                    push_bytes_to_channel(&mut codec, &buf[..count], &card_tx);
+                    push_bytes_to_channel(&mut codec, &buf[..count], &card_tx, &write_result_tx);
                 }
                 Ok(_) => {}
                 Err(err) => {
@@ -34,8 +35,14 @@ pub fn spawn_uart_tasks(
     });
 
     let tx_handle = thread::spawn(move || {
-        while let Ok(ack) = ack_rx.recv() {
-            let bytes = CardFrameCodec::ack_to_bytes(&ack);
+        while let Ok(command) = cmd_rx.recv() {
+            let bytes = match command {
+                SerialCommand::Ack(ack) => SerialFrameCodec::ack_to_bytes(&ack),
+                SerialCommand::Write(req) => SerialFrameCodec::write_req_to_bytes(&req),
+            };
+            if bytes.is_empty() {
+                continue;
+            }
             log_bytes("UART TX:", &bytes);
             if let Err(err) = tx.write(&bytes) {
                 log::warn!("UART TX error: {:?}", err);

@@ -1,9 +1,46 @@
-use crate::model::{RouteConfig, TapEvent};
+use crate::model::{CardStateSnapshot, RouteConfig, TapEvent};
 
 /// 刷卡事件缓存（用于批量上报或 UI 显示）。
 pub struct TapEventCache {
     max_len: usize,
     events: Vec<TapEvent>,
+}
+
+/// 卡片状态快照缓存。
+pub struct CardStateSnapshotCache {
+    max_len: usize,
+    entries: Vec<CardStateSnapshot>,
+}
+
+impl CardStateSnapshotCache {
+    /// 创建快照缓存。
+    pub fn new(max_len: usize) -> Self {
+        Self {
+            max_len,
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.entries.len() >= self.max_len
+    }
+
+    pub fn push(&mut self, snapshot: CardStateSnapshot) -> Result<(), CardStateSnapshot> {
+        if self.is_full() {
+            return Err(snapshot);
+        }
+        self.entries.push(snapshot);
+        Ok(())
+    }
+
+    pub fn drain_batch(&mut self, limit: usize) -> Vec<CardStateSnapshot> {
+        let take = core::cmp::min(limit, self.entries.len());
+        self.entries.drain(0..take).collect()
+    }
 }
 
 impl TapEventCache {

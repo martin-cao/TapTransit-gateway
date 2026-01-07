@@ -5,31 +5,36 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::model::UploadRecord;
 use crate::net::NetCommand;
 use crate::processor::GatewayProcessor;
-use crate::serial::{CardAck, CardDetected};
+use crate::serial::{CardDetected, CardWriteResult, SerialCommand};
 
 /// 处理管线的通道集合（刷卡事件、ACK、上传）。
 pub struct GatewayChannels {
     pub card_tx: Sender<CardDetected>,
     pub card_rx: Receiver<CardDetected>,
-    pub ack_tx: Sender<CardAck>,
-    pub ack_rx: Receiver<CardAck>,
+    pub cmd_tx: Sender<SerialCommand>,
+    pub cmd_rx: Receiver<SerialCommand>,
     pub upload_tx: Sender<UploadRecord>,
     pub upload_rx: Receiver<UploadRecord>,
+    pub write_result_tx: Sender<CardWriteResult>,
+    pub write_result_rx: Receiver<CardWriteResult>,
 }
 
 impl GatewayChannels {
     /// 创建默认的 mpsc 通道。
     pub fn new() -> Self {
         let (card_tx, card_rx) = mpsc::channel();
-        let (ack_tx, ack_rx) = mpsc::channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
         let (upload_tx, upload_rx) = mpsc::channel();
+        let (write_result_tx, write_result_rx) = mpsc::channel();
         Self {
             card_tx,
             card_rx,
-            ack_tx,
-            ack_rx,
+            cmd_tx,
+            cmd_rx,
             upload_tx,
             upload_rx,
+            write_result_tx,
+            write_result_rx,
         }
     }
 }
@@ -38,7 +43,7 @@ impl GatewayChannels {
 pub fn spawn_processor_loop(
     mut processor: GatewayProcessor,
     card_rx: Receiver<CardDetected>,
-    ack_tx: Sender<CardAck>,
+    cmd_tx: Sender<SerialCommand>,
     upload_tx: Sender<UploadRecord>,
     net_cmd_tx: Sender<NetCommand>,
 ) -> thread::JoinHandle<()> {
@@ -46,18 +51,41 @@ pub fn spawn_processor_loop(
         // 阻塞等待刷卡事件
         while let Ok(card) = card_rx.recv() {
             let now = current_epoch();
+            // 无论是否能解析卡内数据，都先尝试从后端查询卡片信息（用于补全余额/状态）。
+            let _ = net_cmd_tx.send(NetCommand::LookupCard {
+                card_id: card.card_id.clone(),
+            });
             let decision = processor.handle_card(card, now);
+            // 发送写卡请求（如有）
+            if let Some(write_req) = decision.write_request {
+                let _ = cmd_tx.send(SerialCommand::Write(write_req));
+            }
             // 发送串口 ACK
-            let _ = ack_tx.send(decision.ack);
+            let _ = cmd_tx.send(SerialCommand::Ack(decision.ack));
             if let Some(record) = decision.upload_record {
                 // 推送上报记录
                 let _ = upload_tx.send(record);
             }
-            if let Some(ref event) = decision.event {
-                // 触发卡片信息查询（后台可回写折扣）
-                let _ = net_cmd_tx.send(NetCommand::LookupCard {
-                    card_id: event.card_id.clone(),
-                });
+            if let Some(registration) = decision.registration {
+                let _ = net_cmd_tx.send(NetCommand::RegisterCard { payload: registration });
+            }
+        }
+    })
+}
+
+/// 写卡结果处理线程：更新网关状态提示。
+pub fn spawn_write_result_loop(
+    state: std::sync::Arc<std::sync::Mutex<crate::state::GatewayState>>,
+    write_result_rx: Receiver<CardWriteResult>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        while let Ok(result) = write_result_rx.recv() {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if let Ok(mut state) = state.lock() {
+                state.handle_write_result(result, now_ms);
             }
         }
     })

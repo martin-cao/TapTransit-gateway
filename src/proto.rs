@@ -16,6 +16,8 @@ pub const MSG_CARD_ACK: u8 = 0x02;
 pub const MSG_SET_ROUTE_INFO: u8 = 0x03;
 pub const MSG_HEARTBEAT: u8 = 0x04;
 pub const MSG_ERROR_REPORT: u8 = 0x05;
+pub const MSG_CARD_WRITE_REQ: u8 = 0x06;
+pub const MSG_CARD_WRITE_RESULT: u8 = 0x07;
 
 /// 解码错误类型。
 #[derive(Clone, Debug)]

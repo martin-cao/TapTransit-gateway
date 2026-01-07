@@ -1,5 +1,6 @@
 // 模块划分：串口、协议、处理管线、网络与 Web UI
 mod api;
+mod card_data;
 mod cache;
 mod model;
 mod net;
@@ -58,17 +59,20 @@ fn main() {
     let pipeline::GatewayChannels {
         card_tx,
         card_rx,
-        ack_tx,
-        ack_rx,
+        cmd_tx,
+        cmd_rx,
         upload_tx,
         upload_rx,
+        write_result_tx,
+        write_result_rx,
     } = pipeline::GatewayChannels::new();
     let (net_cmd_tx, net_cmd_rx) = mpsc::channel();
     let processor = GatewayProcessor::new(state.clone());
     let _processor_handle =
-        spawn_processor_loop(processor, card_rx, ack_tx.clone(), upload_tx.clone(), net_cmd_tx.clone());
+        spawn_processor_loop(processor, card_rx, cmd_tx.clone(), upload_tx.clone(), net_cmd_tx.clone());
+    let _write_result_handle = pipeline::spawn_write_result_loop(state.clone(), write_result_rx);
     let (_uart_rx_handle, _uart_tx_handle) =
-        uart_link::spawn_uart_tasks(uart_rx, uart_tx, card_tx.clone(), ack_rx);
+        uart_link::spawn_uart_tasks(uart_rx, uart_tx, card_tx.clone(), write_result_tx, cmd_rx);
 
     // 连接 Wi-Fi（失败不阻塞主流程，保持离线可用）
     let _wifi = match net::connect_wifi(modem) {

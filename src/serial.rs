@@ -1,4 +1,6 @@
-use crate::proto::{Frame, MSG_CARD_ACK, MSG_CARD_DETECTED};
+use crate::proto::{
+    Frame, MSG_CARD_ACK, MSG_CARD_DETECTED, MSG_CARD_WRITE_REQ, MSG_CARD_WRITE_RESULT,
+};
 
 /// 读卡器上报的刷卡事件。
 #[derive(Clone, Debug)]
@@ -28,6 +30,42 @@ pub struct CardAck {
     pub display_code: u8,
     pub write_flag: u8,
     pub write_data: Vec<u8>,
+}
+
+/// 网关下发的写卡请求。
+#[derive(Clone, Debug)]
+pub struct CardWriteRequest {
+    pub card_id: String,
+    pub card_data: Vec<u8>,
+    pub block_start: u8,
+    pub block_count: u8,
+}
+
+impl CardWriteRequest {
+    /// 编码为串口协议帧。
+    pub fn to_frame(&self) -> Frame {
+        Frame {
+            msg_type: MSG_CARD_WRITE_REQ,
+            flags: 0,
+            payload: encode_card_write_request(self),
+        }
+    }
+}
+
+/// 读卡器写卡结果回传。
+#[derive(Clone, Debug)]
+pub struct CardWriteResult {
+    pub result: u8,
+    pub error_code: u8,
+    pub block_start: u8,
+    pub block_count: u8,
+}
+
+/// 串口发送命令（ACK 或写卡）。
+#[derive(Clone, Debug)]
+pub enum SerialCommand {
+    Ack(CardAck),
+    Write(CardWriteRequest),
 }
 
 impl CardAck {
@@ -114,6 +152,14 @@ pub fn card_ack_from_frame(frame: &Frame) -> Option<CardAck> {
     decode_card_ack(&frame.payload)
 }
 
+/// 从帧中提取 CardWriteResult。
+pub fn card_write_result_from_frame(frame: &Frame) -> Option<CardWriteResult> {
+    if frame.msg_type != MSG_CARD_WRITE_RESULT {
+        return None;
+    }
+    decode_card_write_result(&frame.payload)
+}
+
 /// 编码 CardDetected 载荷。
 fn encode_card_detected(msg: &CardDetected) -> Vec<u8> {
     let mut out = Vec::new();
@@ -129,6 +175,31 @@ fn encode_card_ack(msg: &CardAck) -> Vec<u8> {
     let mut out = vec![msg.result, msg.beep_pattern, msg.display_code, msg.write_flag];
     write_bytes(&mut out, &msg.write_data);
     out
+}
+
+/// 编码 CardWriteRequest 载荷。
+fn encode_card_write_request(msg: &CardWriteRequest) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_string(&mut out, &msg.card_id);
+    let data_len = msg.card_data.len().min(u8::MAX as usize);
+    out.push(data_len as u8);
+    out.extend_from_slice(&msg.card_data[..data_len]);
+    out.push(msg.block_start);
+    out.push(msg.block_count);
+    out
+}
+
+/// 解码 CARD_WRITE_RESULT 载荷。
+fn decode_card_write_result(payload: &[u8]) -> Option<CardWriteResult> {
+    if payload.len() < 4 {
+        return None;
+    }
+    Some(CardWriteResult {
+        result: payload[0],
+        error_code: payload[1],
+        block_start: payload[2],
+        block_count: payload[3],
+    })
 }
 
 /// 写入字符串（u8 长度前缀）。
