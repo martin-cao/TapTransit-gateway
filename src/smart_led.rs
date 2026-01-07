@@ -11,13 +11,16 @@ use crate::model::PassengerTone;
 use crate::state::GatewayState;
 use std::sync::{Arc, Mutex};
 
-const BRIGHTNESS_SCALE: u8 = 77; // ~30% of 255
+// 亮度缩放（约 30%）。
+const BRIGHTNESS_SCALE: u8 = 77;
 
+/// WS2812 智能灯封装（通过 RMT 发送）。
 pub struct SmartLed<'d> {
     tx: TxRmtDriver<'d>,
 }
 
 impl<'d> SmartLed<'d> {
+    /// 初始化 RMT 发送器。
     pub fn new<C, P, Ch, Pin>(channel: C, pin: P) -> Result<Self, EspError>
     where
         C: Peripheral<P = Ch> + 'd,
@@ -30,10 +33,12 @@ impl<'d> SmartLed<'d> {
         Ok(Self { tx })
     }
 
+    /// 设置单色显示。
     pub fn set_color(&mut self, color: RGB8) -> Result<(), EspError> {
         self.write([color].into_iter())
     }
 
+    /// 亮度缩放，降低刺眼程度。
     fn apply_brightness(color: RGB8) -> RGB8 {
         let scale = BRIGHTNESS_SCALE as u16;
         let apply = |v| ((v as u16 * scale) / 255) as u8;
@@ -44,6 +49,7 @@ impl<'d> SmartLed<'d> {
         }
     }
 
+    /// 生成 GRB 24bit 脉冲序列。
     fn render_signal(&self, color: RGB8) -> Result<FixedLengthSignal<24>, EspError> {
         let color = Self::apply_brightness(color);
         let grb: u32 = ((color.g as u32) << 16) | ((color.r as u32) << 8) | color.b as u32;
@@ -81,6 +87,7 @@ impl SmartLedsWrite for SmartLed<'_> {
     }
 }
 
+/// 启动灯带任务：根据刷卡状态闪烁颜色。
 pub fn spawn_led_task<C, P, Ch, Pin>(channel: C, pin: P, state: Arc<Mutex<GatewayState>>)
 where
     C: Peripheral<P = Ch> + Send + 'static,
@@ -105,6 +112,7 @@ where
             let mut next_tone = None;
             if let Ok(state) = state.lock() {
                 let current_tone = state.last_passenger_tone;
+                // 新刷卡触发或提示音改变则更新灯色
                 if state.last_tap_nonce != last_nonce {
                     last_nonce = state.last_tap_nonce;
                     last_tone = current_tone;
@@ -137,6 +145,7 @@ where
     });
 }
 
+/// 将提示音色映射到 LED 颜色。
 fn tone_color(tone: PassengerTone) -> RGB8 {
     match tone {
         PassengerTone::Normal => RGB8 { r: 0, g: 0, b: 255 },

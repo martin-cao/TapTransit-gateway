@@ -1,3 +1,4 @@
+/// 司机操作动作（由 Web UI 触发）。
 #[derive(Clone, Debug)]
 pub enum DriverAction {
     SetRoute { route_id: u16 },
@@ -10,6 +11,7 @@ pub enum DriverAction {
     SetBackend { base_url: String },
 }
 
+/// Web UI 展示的状态面板数据。
 #[derive(Clone, Debug)]
 pub struct StatusPanel {
     pub route_id: u16,
@@ -30,12 +32,14 @@ pub struct StatusPanel {
     pub last_fare_label: String,
 }
 
+/// 操作结果（预留扩展）。
 #[derive(Clone, Debug)]
 pub struct ActionResult {
     pub success: bool,
     pub message: String,
 }
 
+/// 渲染司机网页（手工拼接 HTML，避免引入模板引擎）。
 pub fn render_index(status: &StatusPanel) -> String {
     let direction = match status.direction {
         crate::model::Direction::Up => "上行",
@@ -260,6 +264,7 @@ pub fn render_index(status: &StatusPanel) -> String {
     html
 }
 
+/// 解析 URL 查询字符串为 DriverAction。
 pub fn parse_action(query: &str) -> Option<DriverAction> {
     let action_type = query_value(query, "type")?;
     match action_type.as_str() {
@@ -293,6 +298,7 @@ pub fn parse_action(query: &str) -> Option<DriverAction> {
     }
 }
 
+/// 获取查询参数值（未进行 URL 解码）。
 fn query_value(query: &str, key: &str) -> Option<String> {
     for part in query.split('&') {
         let mut iter = part.splitn(2, '=');
@@ -305,6 +311,7 @@ fn query_value(query: &str, key: &str) -> Option<String> {
     None
 }
 
+/// URL 解码（处理 %xx 与 +）。
 fn decode_component(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let bytes = input.as_bytes();
@@ -335,6 +342,7 @@ fn decode_component(input: &str) -> String {
     out
 }
 
+/// 十六进制字符转数值。
 fn hex_value(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -344,6 +352,7 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+/// 票价格式化为人民币显示。
 fn format_fare(fare: Option<f32>) -> String {
     match fare {
         Some(amount) => format!("¥{:.2}", amount),

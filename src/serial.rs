@@ -1,5 +1,6 @@
 use crate::proto::{Frame, MSG_CARD_ACK, MSG_CARD_DETECTED};
 
+/// 读卡器上报的刷卡事件。
 #[derive(Clone, Debug)]
 pub struct CardDetected {
     pub card_id: String,
@@ -9,6 +10,7 @@ pub struct CardDetected {
 }
 
 impl CardDetected {
+    /// 编码为串口协议帧。
     pub fn to_frame(&self) -> Frame {
         Frame {
             msg_type: MSG_CARD_DETECTED,
@@ -18,6 +20,7 @@ impl CardDetected {
     }
 }
 
+/// 网关返回给读卡器的 ACK 指令。
 #[derive(Clone, Debug)]
 pub struct CardAck {
     pub result: u8,
@@ -28,6 +31,7 @@ pub struct CardAck {
 }
 
 impl CardAck {
+    /// 默认通过刷卡（成功提示）。
     pub fn accepted() -> Self {
         Self {
             result: 1,
@@ -38,6 +42,7 @@ impl CardAck {
         }
     }
 
+    /// 默认拒绝刷卡（错误提示）。
     pub fn rejected() -> Self {
         Self {
             result: 0,
@@ -48,6 +53,7 @@ impl CardAck {
         }
     }
 
+    /// 编码为串口协议帧。
     pub fn to_frame(&self) -> Frame {
         Frame {
             msg_type: MSG_CARD_ACK,
@@ -57,6 +63,7 @@ impl CardAck {
     }
 }
 
+/// 解码 CARD_DETECTED 载荷。
 pub fn decode_card_detected(payload: &[u8]) -> Option<CardDetected> {
     let mut cursor = 0;
     let card_id = read_string(payload, &mut cursor)?;
@@ -71,6 +78,7 @@ pub fn decode_card_detected(payload: &[u8]) -> Option<CardDetected> {
     })
 }
 
+/// 解码 CARD_ACK 载荷。
 pub fn decode_card_ack(payload: &[u8]) -> Option<CardAck> {
     if payload.len() < 4 {
         return None;
@@ -90,6 +98,7 @@ pub fn decode_card_ack(payload: &[u8]) -> Option<CardAck> {
     })
 }
 
+/// 从帧中提取 CardDetected。
 pub fn card_detected_from_frame(frame: &Frame) -> Option<CardDetected> {
     if frame.msg_type != MSG_CARD_DETECTED {
         return None;
@@ -97,6 +106,7 @@ pub fn card_detected_from_frame(frame: &Frame) -> Option<CardDetected> {
     decode_card_detected(&frame.payload)
 }
 
+/// 从帧中提取 CardAck。
 pub fn card_ack_from_frame(frame: &Frame) -> Option<CardAck> {
     if frame.msg_type != MSG_CARD_ACK {
         return None;
@@ -104,6 +114,7 @@ pub fn card_ack_from_frame(frame: &Frame) -> Option<CardAck> {
     decode_card_ack(&frame.payload)
 }
 
+/// 编码 CardDetected 载荷。
 fn encode_card_detected(msg: &CardDetected) -> Vec<u8> {
     let mut out = Vec::new();
     write_string(&mut out, &msg.card_id);
@@ -113,12 +124,14 @@ fn encode_card_detected(msg: &CardDetected) -> Vec<u8> {
     out
 }
 
+/// 编码 CardAck 载荷。
 fn encode_card_ack(msg: &CardAck) -> Vec<u8> {
     let mut out = vec![msg.result, msg.beep_pattern, msg.display_code, msg.write_flag];
     write_bytes(&mut out, &msg.write_data);
     out
 }
 
+/// 写入字符串（u8 长度前缀）。
 fn write_string(out: &mut Vec<u8>, value: &str) {
     let bytes = value.as_bytes();
     let len = bytes.len().min(u8::MAX as usize);
@@ -126,12 +139,14 @@ fn write_string(out: &mut Vec<u8>, value: &str) {
     out.extend_from_slice(&bytes[..len]);
 }
 
+/// 写入字节数组（u16 长度前缀）。
 fn write_bytes(out: &mut Vec<u8>, value: &[u8]) {
     let len = value.len().min(u16::MAX as usize);
     out.extend_from_slice(&(len as u16).to_le_bytes());
     out.extend_from_slice(&value[..len]);
 }
 
+/// 读取字符串（u8 长度前缀）。
 fn read_string(data: &[u8], cursor: &mut usize) -> Option<String> {
     if *cursor >= data.len() {
         return None;
@@ -146,6 +161,7 @@ fn read_string(data: &[u8], cursor: &mut usize) -> Option<String> {
     Some(value)
 }
 
+/// 读取字节数组（u16 长度前缀）。
 fn read_bytes(data: &[u8], cursor: &mut usize) -> Option<Vec<u8>> {
     let len = read_u16(data, cursor)? as usize;
     if *cursor + len > data.len() {
@@ -156,6 +172,7 @@ fn read_bytes(data: &[u8], cursor: &mut usize) -> Option<Vec<u8>> {
     Some(value)
 }
 
+/// 读取 u16（小端）。
 fn read_u16(data: &[u8], cursor: &mut usize) -> Option<u16> {
     if *cursor + 2 > data.len() {
         return None;
@@ -165,6 +182,7 @@ fn read_u16(data: &[u8], cursor: &mut usize) -> Option<u16> {
     Some(value)
 }
 
+/// 读取 u32（小端）。
 fn read_u32(data: &[u8], cursor: &mut usize) -> Option<u32> {
     if *cursor + 4 > data.len() {
         return None;

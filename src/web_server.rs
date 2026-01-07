@@ -12,6 +12,7 @@ use crate::model::{FareType, TapMode};
 use crate::state::GatewayState;
 use crate::web::{parse_action, render_index, DriverAction, StatusPanel};
 
+/// 启动内置 HTTP 服务（司机操作页）。
 pub fn start_server(
     state: Arc<Mutex<GatewayState>>,
     net_cmd_tx: Sender<NetCommand>,
@@ -21,6 +22,7 @@ pub fn start_server(
         ..Default::default()
     })?;
 
+    // 首页：渲染 HTML
     let state_root = state.clone();
     server.fn_handler("/", Method::Get, move |req| {
         let status = status_from_state(&state_root);
@@ -29,6 +31,7 @@ pub fn start_server(
             .map(|_| ())
     })?;
 
+    // 状态接口：JSON
     let state_status = state.clone();
     server.fn_handler("/status", Method::Get, move |req| {
         let status = status_from_state(&state_status);
@@ -67,6 +70,7 @@ pub fn start_server(
             .map(|_| ())
     })?;
 
+    // 操作接口：通过 query 参数触发动作
     let state_action = state.clone();
     let net_cmd_action = net_cmd_tx.clone();
     server.fn_handler("/action", Method::Get, move |req| {
@@ -83,6 +87,7 @@ pub fn start_server(
     Ok(server)
 }
 
+/// 执行司机操作指令，并触发必要的同步/上传。
 fn apply_action(state: &Arc<Mutex<GatewayState>>, net_cmd_tx: &Sender<NetCommand>, action: DriverAction) {
     match action {
         DriverAction::SetRoute { route_id } => {
@@ -135,8 +140,10 @@ fn apply_action(state: &Arc<Mutex<GatewayState>>, net_cmd_tx: &Sender<NetCommand
     }
 }
 
+/// 从全局状态构建前端面板展示数据。
 fn status_from_state(state: &Arc<Mutex<GatewayState>>) -> StatusPanel {
     if let Ok(mut state) = state.lock() {
+        // 清理过期提示
         let now_ms = current_epoch_millis();
         if state.last_message_deadline_ms > 0 && now_ms >= state.last_message_deadline_ms {
             state.last_message_deadline_ms = 0;
@@ -150,6 +157,7 @@ fn status_from_state(state: &Arc<Mutex<GatewayState>>) -> StatusPanel {
         let mut route_name = String::new();
         let mut tap_mode_label = "未同步".to_string();
         let mut fare_type_label = "未同步".to_string();
+        // 若已同步配置，使用更友好的标签
         if let Some(cfg) = state.config_cache.route.as_ref() {
             route_name = cfg.route_name.clone();
             tap_mode_label = match cfg.tap_mode {
@@ -183,6 +191,7 @@ fn status_from_state(state: &Arc<Mutex<GatewayState>>) -> StatusPanel {
             last_fare_label: state.last_fare_label.clone(),
         }
     } else {
+        // 无法获取锁时返回默认状态
         StatusPanel {
             route_id: 0,
             route_name: String::new(),
@@ -204,6 +213,7 @@ fn status_from_state(state: &Arc<Mutex<GatewayState>>) -> StatusPanel {
     }
 }
 
+/// 规范化后端地址（自动补齐协议/去尾斜杠）。
 fn normalize_backend_url(input: String) -> String {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -216,6 +226,7 @@ fn normalize_backend_url(input: String) -> String {
     url.trim_end_matches('/').to_string()
 }
 
+/// 当前时间戳（毫秒）。
 fn current_epoch_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

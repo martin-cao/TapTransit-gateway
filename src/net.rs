@@ -24,10 +24,12 @@ use crate::model::{
 use crate::state::GatewayState;
 use crate::upload::BatchUpload;
 
+// Wi-Fi 与后端地址来自编译期环境变量。
 const WIFI_SSID: &str = env!("WIFI_SSID");
 const WIFI_PASS: &str = env!("WIFI_PASS");
 const BACKEND_BASE_URL: &str = env!("BACKEND_BASE_URL");
 
+/// 网络控制命令（来自 UI 或业务逻辑）。
 #[derive(Clone, Debug)]
 pub enum NetCommand {
     SyncConfig { route_id: u16 },
@@ -36,6 +38,7 @@ pub enum NetCommand {
     LookupCard { card_id: String },
 }
 
+/// 网络请求错误类型。
 #[derive(Debug)]
 pub enum NetError {
     Io(EspIOError),
@@ -62,6 +65,7 @@ impl From<serde_json::Error> for NetError {
     }
 }
 
+/// 通用 API 响应格式（与后端保持一致）。
 #[derive(Deserialize)]
 struct ApiResponse<T> {
     success: bool,
@@ -69,11 +73,13 @@ struct ApiResponse<T> {
     message: Option<String>,
 }
 
+/// 连接 Wi-Fi（阻塞直到联网）。
 pub fn connect_wifi(modem: Modem) -> Result<BlockingWifi<EspWifi<'static>>, EspError> {
     let sys_loop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take().ok();
     let mut wifi = BlockingWifi::wrap(EspWifi::new(modem, sys_loop.clone(), nvs)?, sys_loop)?;
 
+    // 选择认证方式
     let auth_method = if WIFI_PASS.is_empty() {
         AuthMethod::None
     } else {
@@ -89,6 +95,7 @@ pub fn connect_wifi(modem: Modem) -> Result<BlockingWifi<EspWifi<'static>>, EspE
         ..Default::default()
     });
 
+    // 启动并连接
     wifi.set_configuration(&wifi_configuration)?;
     wifi.start()?;
     log::info!("Wi-Fi started");
@@ -106,6 +113,7 @@ pub fn spawn_network_loop(
     settings: GatewaySettings,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
+        // 上传缓冲区与配置刷新计时
         let mut buffer: Vec<UploadRecord> = Vec::with_capacity(settings.batch_size);
         let mut route_id: Option<u16> = None;
         let mut last_upload = Instant::now();
@@ -119,12 +127,14 @@ pub fn spawn_network_loop(
             while let Ok(cmd) = command_rx.try_recv() {
                 match cmd {
                     NetCommand::SyncConfig { route_id: next_route } => {
+                        // 立即刷新配置
                         route_id = Some(next_route);
                         if sync_config(&state, next_route) {
                             last_sync = Instant::now();
                         }
                     }
                     NetCommand::UploadNow => {
+                        // 立即上报当前缓冲
                         while let Ok(record) = upload_rx.try_recv() {
                             buffer.push(record);
                         }
@@ -133,11 +143,13 @@ pub fn spawn_network_loop(
                         }
                     }
                     NetCommand::SetBackend { base_url } => {
+                        // 切换后端地址
                         if let Ok(mut state) = state.lock() {
                             state.update_backend_base_url(base_url);
                         }
                     }
                     NetCommand::LookupCard { card_id } => {
+                        // 查询卡片信息（票种/折扣/状态）
                         let base_url = resolve_base_url(&state);
                         match fetch_card_profile(&base_url, &card_id) {
                             Ok(Some(profile)) => {
@@ -154,6 +166,7 @@ pub fn spawn_network_loop(
 
             if let Some(route_id) = route_id {
                 if last_sync.elapsed() >= Duration::from_secs(refresh_secs) {
+                    // 定期刷新配置与黑名单
                     if sync_config(&state, route_id) {
                         last_sync = Instant::now();
                     }
@@ -165,12 +178,14 @@ pub fn spawn_network_loop(
                     buffer.push(record);
                     last_upload = Instant::now();
                     if buffer.len() >= settings.batch_size {
+                        // 达到批量阈值触发上传
                         if let Err(err) = flush_batch(&state, &mut buffer) {
                             log::warn!("Upload batch failed: {:?}", err);
                         }
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
+                    // 超时且有缓存，按时间间隔触发上传
                     if !buffer.is_empty() && last_upload.elapsed() >= Duration::from_secs(5) {
                         if let Err(err) = flush_batch(&state, &mut buffer) {
                             log::warn!("Upload batch failed: {:?}", err);
@@ -183,6 +198,7 @@ pub fn spawn_network_loop(
     })
 }
 
+/// 上报一批记录到后端。
 fn flush_batch(state: &Arc<Mutex<GatewayState>>, buffer: &mut Vec<UploadRecord>) -> Result<(), NetError> {
     if buffer.is_empty() {
         return Ok(());
@@ -216,6 +232,7 @@ fn flush_batch(state: &Arc<Mutex<GatewayState>>, buffer: &mut Vec<UploadRecord>)
     Ok(())
 }
 
+/// 同步线路配置与黑名单。
 fn sync_config(state: &Arc<Mutex<GatewayState>>, route_id: u16) -> bool {
     let now = current_epoch();
     let mut ok = false;
@@ -249,6 +266,7 @@ fn sync_config(state: &Arc<Mutex<GatewayState>>, route_id: u16) -> bool {
     ok
 }
 
+/// 请求后端线路配置。
 fn fetch_route_config(base_url: &str, route_id: u16) -> Result<RouteConfig, NetError> {
     let url = format!("{}{}?route_id={}", base_url, CONFIG_PATH, route_id);
     let mut client = HttpClient::wrap(EspHttpConnection::new(&Default::default())?);
@@ -270,6 +288,7 @@ fn fetch_route_config(base_url: &str, route_id: u16) -> Result<RouteConfig, NetE
     Ok(config.into())
 }
 
+/// 请求后端黑名单列表。
 fn fetch_blacklist(base_url: &str) -> Result<Vec<String>, NetError> {
     let url = format!("{}{}?status=blocked", base_url, CARDS_PATH);
     let mut client = HttpClient::wrap(EspHttpConnection::new(&Default::default())?);
@@ -289,6 +308,7 @@ fn fetch_blacklist(base_url: &str) -> Result<Vec<String>, NetError> {
     Ok(cards.into_iter().filter_map(|card| card.card_id).collect())
 }
 
+/// 查询卡片详细信息（票种/状态/折扣）。
 fn fetch_card_profile(base_url: &str, card_id: &str) -> Result<Option<CardProfile>, NetError> {
     let url = format!("{}{}?card_id={}", base_url, CARDS_PATH, card_id);
     let mut client = HttpClient::wrap(EspHttpConnection::new(&Default::default())?);
@@ -313,6 +333,7 @@ fn fetch_card_profile(base_url: &str, card_id: &str) -> Result<Option<CardProfil
     }))
 }
 
+/// 读取 HTTP 响应体。
 fn read_response_body(
     response: &mut embedded_svc::http::client::Response<&mut EspHttpConnection>,
 ) -> Result<Vec<u8>, EspIOError> {
@@ -328,12 +349,14 @@ fn read_response_body(
     Ok(body)
 }
 
+/// 更新后端可达性状态。
 fn update_backend_status(state: &Arc<Mutex<GatewayState>>, reachable: bool) {
     if let Ok(mut state) = state.lock() {
         state.update_health(None, Some(reachable));
     }
 }
 
+/// 获取当前后端地址（优先使用运行时设置）。
 fn resolve_base_url(state: &Arc<Mutex<GatewayState>>) -> String {
     if let Ok(state) = state.lock() {
         if !state.backend_base_url.is_empty() {
@@ -343,6 +366,7 @@ fn resolve_base_url(state: &Arc<Mutex<GatewayState>>) -> String {
     BACKEND_BASE_URL.to_string()
 }
 
+/// 将卡片画像应用到网关状态与 UI 提示。
 fn apply_card_profile(state: &Arc<Mutex<GatewayState>>, card_id: &str, profile: CardProfile) {
     let Some(tone) = tone_from_profile(&profile) else {
         return;
@@ -381,6 +405,7 @@ fn apply_card_profile(state: &Arc<Mutex<GatewayState>>, card_id: &str, profile: 
     }
 }
 
+/// 当前时间戳（秒）。
 fn current_epoch() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(duration) => duration.as_secs(),
@@ -388,6 +413,7 @@ fn current_epoch() -> u64 {
     }
 }
 
+/// 当前时间戳（毫秒）。
 fn current_epoch_millis() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(duration) => duration.as_millis() as u64,
@@ -395,6 +421,7 @@ fn current_epoch_millis() -> u64 {
     }
 }
 
+/// 后端返回的线路配置（网关侧解析用）。
 #[derive(Deserialize)]
 struct RouteConfigResponse {
     route_id: u16,
@@ -451,6 +478,7 @@ struct CardResponse {
     discount_amount: Option<f32>,
 }
 
+/// 卡片画像（用于状态与优惠更新）。
 struct CardProfile {
     card_type: Option<String>,
     status: Option<String>,
@@ -458,6 +486,7 @@ struct CardProfile {
     discount_amount: Option<f32>,
 }
 
+/// 根据卡片画像确定提示音色。
 fn tone_from_profile(profile: &CardProfile) -> Option<PassengerTone> {
     if let Some(status) = profile.status.as_deref() {
         if status == "blocked" || status == "lost" {
@@ -473,6 +502,7 @@ fn tone_from_profile(profile: &CardProfile) -> Option<PassengerTone> {
     }
 }
 
+/// 将后端响应转换为网关内部模型。
 impl From<RouteConfigResponse> for RouteConfig {
     fn from(value: RouteConfigResponse) -> Self {
         let fare_type = match value.fare_type.as_deref() {

@@ -6,8 +6,10 @@ use crate::serial::{CardAck, CardDetected};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// 卡片缓存过期时间（10 分钟）。
 const CARD_CACHE_TTL_MS: u64 = 10 * 60 * 1000;
 
+/// 卡片缓存的用户画像（票种/状态/优惠）。
 #[derive(Clone, Debug)]
 pub struct CachedCardProfile {
     pub card_type: Option<String>,
@@ -17,6 +19,7 @@ pub struct CachedCardProfile {
     pub updated_at_ms: u64,
 }
 
+/// 当前线路/站点/方向状态。
 #[derive(Clone, Debug)]
 pub struct RouteState {
     pub route_id: u16,
@@ -26,6 +29,7 @@ pub struct RouteState {
 }
 
 impl RouteState {
+    /// 构造线路状态。
     pub fn new(route_id: u16, station_id: u16, station_name: String, direction: Direction) -> Self {
         Self {
             route_id,
@@ -36,6 +40,7 @@ impl RouteState {
     }
 }
 
+/// 网关全局状态（缓存、健康、上次刷卡等）。
 pub struct GatewayState {
     pub settings: GatewaySettings,
     pub route_state: RouteState,
@@ -60,6 +65,7 @@ pub struct GatewayState {
     record_seq: u32,
 }
 
+/// 处理一次刷卡后的决策输出（ACK + 上报记录）。
 pub struct Decision {
     pub ack: CardAck,
     pub event: Option<TapEvent>,
@@ -67,6 +73,7 @@ pub struct Decision {
 }
 
 impl GatewayState {
+    /// 构造完整状态（供测试/初始化用）。
     pub fn new(
         settings: GatewaySettings,
         route_state: RouteState,
@@ -102,6 +109,7 @@ impl GatewayState {
     }
 
     pub fn bootstrap(settings: GatewaySettings) -> Self {
+        // 启动时默认线路未设置
         let route_state = RouteState::new(0, 0, "未设置".to_string(), Direction::Up);
         Self::new(
             settings.clone(),
@@ -121,6 +129,7 @@ impl GatewayState {
         station_name: String,
         direction: Direction,
     ) {
+        // 更新线路与站点信息
         self.route_state.route_id = route_id;
         self.route_state.station_id = station_id;
         self.route_state.station_name = station_name;
@@ -132,6 +141,7 @@ impl GatewayState {
         let station_ids: Vec<u16> = config.stations.iter().map(|s| s.id).collect();
         self.config_cache.update(config.clone(), now);
 
+        // 若当前站点不在新配置中，则重置到最小序号站点
         if self.route_state.route_id != route_id || !station_ids.contains(&self.route_state.station_id)
         {
             if let Some(station) = config.stations.iter().min_by_key(|s| s.sequence) {
@@ -156,14 +166,17 @@ impl GatewayState {
         self.route_state.direction = direction;
     }
 
+    /// 更新黑名单缓存。
     pub fn update_blacklist(&mut self, cards: Vec<String>, now: u64) {
         self.blacklist_cache.replace(cards, now);
     }
 
+    /// 更新后端基础 URL。
     pub fn update_backend_base_url(&mut self, url: String) {
         self.backend_base_url = url;
     }
 
+    /// 更新网络健康状态。
     pub fn update_health(&mut self, wifi_connected: Option<bool>, backend_reachable: Option<bool>) {
         if let Some(connected) = wifi_connected {
             self.wifi_connected = connected;
@@ -174,6 +187,7 @@ impl GatewayState {
     }
 
     pub fn set_station_by_id(&mut self, station_id: u16) -> bool {
+        // 根据站点 ID 直接跳转
         let Some(cfg) = self.config_cache.route.as_ref() else {
             return false;
         };
@@ -186,6 +200,7 @@ impl GatewayState {
     }
 
     pub fn step_station(&mut self, forward: bool) -> bool {
+        // 按顺序切换站点（上一站/下一站）
         let Some(cfg) = self.config_cache.route.as_ref() else {
             return false;
         };
@@ -210,10 +225,12 @@ impl GatewayState {
     }
 
     pub fn handle_card_detected(&mut self, detected: CardDetected, now: u64) -> Decision {
+        // 生成刷卡事件并决定是否上报
         let now_ms = current_epoch_millis();
         self.last_tap_nonce = self.last_tap_nonce.wrapping_add(1);
         let card_id = detected.card_id.clone();
         self.last_card_id = card_id.clone();
+        // 防抖：刷卡过快直接拒绝
         if !self.debounce.allow(&detected.card_id, now) {
             self.last_passenger_tone = PassengerTone::Error;
             self.last_passenger_message = "刷卡过快".to_string();
@@ -251,6 +268,7 @@ impl GatewayState {
         let tap_type = match tap_mode {
             TapMode::SingleTap => TapType::TapIn,
             TapMode::TapInOut => {
+                // 进出站：若存在未完成行程则判定为下车
                 if let Some(prev) = self.active_trips.take(&card_id, now) {
                     board_event = Some(prev);
                     TapType::TapOut
@@ -276,12 +294,14 @@ impl GatewayState {
         let standard_fare = self.standard_fare();
         match (tap_mode, tap_type) {
             (TapMode::SingleTap, TapType::TapIn) => {
+                // 单次刷卡：上车即上报
                 upload_record = Some(UploadRecord::from_tap_in(&event));
                 self.last_fare_base = standard_fare;
                 self.last_fare = standard_fare;
                 self.last_fare_label = "应付".to_string();
             }
             (TapMode::TapInOut, TapType::TapIn) => {
+                // 进站：先缓存行程
                 self.active_trips.insert(event.clone(), now);
                 upload_record = Some(UploadRecord::from_tap_in(&event));
                 let fare = self.estimate_trip_fare(event.station_id, event.station_id);
@@ -290,6 +310,7 @@ impl GatewayState {
                 self.last_fare_label = "起步价".to_string();
             }
             (TapMode::TapInOut, TapType::TapOut) => {
+                // 出站：合并行程并估算价格
                 if let Some(board) = board_event {
                     upload_record = Some(UploadRecord::from_tap_out(
                         &event,
@@ -312,6 +333,7 @@ impl GatewayState {
         }
         self.last_tap_type = Some(tap_type);
 
+        // 默认成功提示
         self.last_passenger_tone = PassengerTone::Normal;
         self.last_passenger_message = "刷卡成功".to_string();
         self.last_message_deadline_ms = now_ms.saturating_add(1000);
@@ -324,12 +346,14 @@ impl GatewayState {
         }
     }
 
+    /// 根据 UI/后端反馈更新提示音色。
     pub fn update_passenger_tone(&mut self, tone: PassengerTone) {
         if tone != PassengerTone::Error {
             self.last_passenger_tone = tone;
         }
     }
 
+    /// 依据卡类型应用默认折扣策略（网关侧预估）。
     pub fn apply_card_discount(&mut self, card_type: &str) {
         let base = self.last_fare_base.or(self.last_fare);
         let Some(base) = base else {
@@ -350,6 +374,7 @@ impl GatewayState {
         self.last_fare_label = self.discount_label().to_string();
     }
 
+    /// 依据后端下发折扣策略应用票价修正。
     pub fn apply_card_discount_policy(
         &mut self,
         card_type: &str,
@@ -408,6 +433,7 @@ impl GatewayState {
         }
     }
 
+    /// 更新卡片缓存（LRU 简化策略）。
     pub fn update_card_cache(
         &mut self,
         card_id: String,
@@ -443,6 +469,7 @@ impl GatewayState {
         let Some(profile) = self.card_cache.get(card_id).cloned() else {
             return;
         };
+        // 过期缓存直接忽略
         if now_ms.saturating_sub(profile.updated_at_ms) > CARD_CACHE_TTL_MS {
             return;
         }
@@ -485,6 +512,7 @@ impl GatewayState {
             .map(round_currency)
     }
 
+    /// 网关侧估算票价（用于即时提示，不作为最终结算）。
     fn estimate_trip_fare(&self, start_station_id: u16, end_station_id: u16) -> Option<f32> {
         let cfg = self.config_cache.route.as_ref()?;
         if start_station_id == 0 || end_station_id == 0 {
@@ -534,12 +562,14 @@ impl GatewayState {
     }
 
     fn next_record_id(&mut self, now: u64) -> String {
+        // 生成幂等记录 ID
         let seq = self.record_seq;
         self.record_seq = self.record_seq.wrapping_add(1);
         format!("{}-{}-{}", self.settings.gateway_id, now, seq)
     }
 }
 
+/// 获取当前毫秒时间戳。
 fn current_epoch_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -547,6 +577,7 @@ fn current_epoch_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// 金额保留两位小数（四舍五入）。
 fn round_currency(value: f32) -> f32 {
     (value * 100.0).round() / 100.0
 }

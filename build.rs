@@ -1,10 +1,13 @@
 use std::fs;
 
 fn main() {
+    // 初始化 ESP-IDF 构建环境变量
     embuild::espidf::sysenv::output();
+    // 从 .env 读取编译期配置
     load_dotenv();
 }
 
+/// 读取 .env 并注入为编译期环境变量。
 fn load_dotenv() {
     const ENV_PATH: &str = ".env";
     println!("cargo:rerun-if-changed={}", ENV_PATH);
@@ -28,6 +31,7 @@ fn load_dotenv() {
         if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
             value = value[1..value.len() - 1].to_string();
         }
+        // 仅允许白名单字段进入编译期环境
         if matches!(
             key,
             "WIFI_SSID" | "WIFI_PASS" | "BACKEND_BASE_URL" | "DEFAULT_ROUTE_ID"

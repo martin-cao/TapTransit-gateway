@@ -2,12 +2,14 @@ use crate::proto::{decode_frame, encode_frame, Frame, FrameError, FRAME_HEADER, 
 use crate::serial::{card_detected_from_frame, CardAck, CardDetected};
 use std::sync::mpsc::Sender;
 
+/// 帧读取器：逐字节组装完整帧。
 pub struct FrameReader {
     buffer: Vec<u8>,
     expected_len: Option<usize>,
 }
 
 impl FrameReader {
+    /// 创建新的帧读取器。
     pub fn new() -> Self {
         Self {
             buffer: Vec::with_capacity(256),
@@ -15,6 +17,7 @@ impl FrameReader {
         }
     }
 
+    /// 推入一个字节，若解析完成则返回帧或错误。
     pub fn push(&mut self, byte: u8) -> Option<Result<Frame, FrameError>> {
         self.buffer.push(byte);
 
@@ -53,27 +56,32 @@ impl FrameReader {
         None
     }
 
+    /// 重置内部状态。
     fn reset(&mut self) {
         self.buffer.clear();
         self.expected_len = None;
     }
 }
 
+/// 将帧编码为字节数组。
 pub fn frame_to_bytes(frame: &Frame) -> Vec<u8> {
     encode_frame(frame)
 }
 
+/// 针对刷卡事件的帧解码器。
 pub struct CardFrameCodec {
     reader: FrameReader,
 }
 
 impl CardFrameCodec {
+    /// 创建解码器。
     pub fn new() -> Self {
         Self {
             reader: FrameReader::new(),
         }
     }
 
+    /// 推入一个字节并尝试解析为 CardDetected。
     pub fn push_byte(&mut self, byte: u8) -> Option<Result<CardDetected, FrameError>> {
         let result = self.reader.push(byte)?;
         match result {
@@ -85,11 +93,13 @@ impl CardFrameCodec {
         }
     }
 
+    /// 将 ACK 编码为字节序列。
     pub fn ack_to_bytes(ack: &CardAck) -> Vec<u8> {
         frame_to_bytes(&ack.to_frame())
     }
 }
 
+/// 逐字节喂给解码器，解析出卡片事件并发送到通道。
 pub fn push_bytes_to_channel(
     codec: &mut CardFrameCodec,
     bytes: &[u8],

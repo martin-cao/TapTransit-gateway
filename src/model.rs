@@ -2,6 +2,7 @@ use std::fmt;
 
 use serde::Serialize;
 
+/// 刷卡类型（上车/下车）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TapType {
     TapIn,
@@ -17,6 +18,7 @@ impl TapType {
     }
 }
 
+/// 刷卡模式（单次/进出站）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TapMode {
     SingleTap,
@@ -32,6 +34,7 @@ impl TapMode {
     }
 }
 
+/// 线路方向。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
     Up,
@@ -47,6 +50,7 @@ impl Direction {
     }
 }
 
+/// 计价类型。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FareType {
     Uniform,
@@ -64,6 +68,7 @@ impl FareType {
     }
 }
 
+/// 乘客提示音色/标签（用于 UI 或蜂鸣提示）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PassengerTone {
     Normal,
@@ -95,6 +100,7 @@ impl PassengerTone {
     }
 }
 
+/// 网关运行参数（可配置项）。
 #[derive(Clone, Debug)]
 pub struct GatewaySettings {
     pub gateway_id: String,
@@ -108,6 +114,7 @@ pub struct GatewaySettings {
 }
 
 impl GatewaySettings {
+    /// 使用指定网关 ID 构建默认参数。
     pub fn with_gateway_id(id: impl Into<String>) -> Self {
         Self {
             gateway_id: id.into(),
@@ -128,6 +135,7 @@ impl Default for GatewaySettings {
     }
 }
 
+/// 站点配置（来自后端下发）。
 #[derive(Clone, Debug)]
 pub struct StationConfig {
     pub id: u16,
@@ -137,6 +145,7 @@ pub struct StationConfig {
     pub is_transfer: bool,
 }
 
+/// 票价规则（简化字段）。
 #[derive(Clone, Debug)]
 pub struct FareRule {
     pub base_price: f32,
@@ -147,6 +156,7 @@ pub struct FareRule {
     pub end_station: Option<u16>,
 }
 
+/// 线路配置（站点 + 票价 + 模式）。
 #[derive(Clone, Debug)]
 pub struct RouteConfig {
     pub route_id: u16,
@@ -158,6 +168,7 @@ pub struct RouteConfig {
     pub fares: Vec<FareRule>,
 }
 
+/// 刷卡事件（网关内部事件模型）。
 #[derive(Clone, Debug)]
 pub struct TapEvent {
     pub record_id: String,
@@ -171,6 +182,7 @@ pub struct TapEvent {
 }
 
 impl TapEvent {
+    /// 构造刷卡事件。
     pub fn new(
         record_id: String,
         card_id: String,
@@ -194,6 +206,7 @@ impl TapEvent {
     }
 }
 
+/// 上传到后端的记录结构体。
 #[derive(Clone, Debug, Serialize)]
 pub struct UploadRecord {
     pub record_id: String,
@@ -209,6 +222,7 @@ pub struct UploadRecord {
 }
 
 impl UploadRecord {
+    /// 从 tap_in 事件构建上报记录。
     pub fn from_tap_in(event: &TapEvent) -> Self {
         Self {
             record_id: event.record_id.clone(),
@@ -224,6 +238,7 @@ impl UploadRecord {
         }
     }
 
+    /// 从 tap_out 事件构建上报记录。
     pub fn from_tap_out(
         event: &TapEvent,
         board_time: u64,
@@ -245,11 +260,13 @@ impl UploadRecord {
     }
 }
 
+/// 将 epoch 秒转换为字符串（后端接受 string 时间）。
 fn format_time(epoch_secs: u64) -> String {
     epoch_secs.to_string()
 }
 
 impl RouteConfig {
+    /// 获取线路的基础票价（取最小非零值作为默认）。
     pub fn standard_fare(&self) -> Option<f32> {
         let mut best: Option<f32> = None;
         for fare in &self.fares {
@@ -267,6 +284,7 @@ impl RouteConfig {
 }
 
 impl fmt::Display for TapEvent {
+    /// 便于日志输出的格式化展示。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,

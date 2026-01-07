@@ -8,6 +8,7 @@ use esp_idf_hal::uart::{UartRxDriver, UartTxDriver};
 use crate::serial::{CardAck, CardDetected};
 use crate::serial_io::{push_bytes_to_channel, CardFrameCodec};
 
+/// 启动 UART 收发任务（RX 解码、TX 发送 ACK）。
 pub fn spawn_uart_tasks(
     rx: UartRxDriver<'static>,
     mut tx: UartTxDriver<'static>,
@@ -20,6 +21,7 @@ pub fn spawn_uart_tasks(
         loop {
             match rx.read(&mut buf, delay::BLOCK) {
                 Ok(count) if count > 0 => {
+                    // 收到数据后写入帧解码器
                     log_bytes("UART RX:", &buf[..count]);
                     push_bytes_to_channel(&mut codec, &buf[..count], &card_tx);
                 }
@@ -45,6 +47,7 @@ pub fn spawn_uart_tasks(
     (rx_handle, tx_handle)
 }
 
+/// 以十六进制输出串口数据。
 fn log_bytes(prefix: &str, bytes: &[u8]) {
     if bytes.is_empty() {
         return;
