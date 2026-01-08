@@ -106,6 +106,8 @@ pub struct GatewayState {
     pub recharge_mode: Option<RechargeMode>,
     pub register_mode: Option<RegisterMode>,
     last_write_context: Option<WriteContext>,
+    // 保存最近一次写卡时的新余额，用于在写卡成功后更新显示
+    last_written_balance_cents: Option<u32>,
     record_seq: u32,
 }
 
@@ -159,6 +161,7 @@ impl GatewayState {
             recharge_mode: None,
             register_mode: None,
             last_write_context: None,
+            last_written_balance_cents: None,
             record_seq: 0,
         }
     }
@@ -283,11 +286,17 @@ impl GatewayState {
     pub fn handle_write_result(&mut self, result: CardWriteResult, now_ms: u64) {
         let context = self.last_write_context.take();
         if result.result == 1 {
+            // 写卡成功，更新显示的余额为刚刚写入的新余额
+            if let Some(new_balance) = self.last_written_balance_cents.take() {
+                self.last_balance_cents = Some(new_balance);
+            }
             if matches!(context, Some(WriteContext::Recharge)) {
                 self.recharge_mode = None;
             }
             return;
         }
+        // 写卡失败，清除保存的余额
+        self.last_written_balance_cents = None;
         let message = match context {
             Some(WriteContext::Recharge) => "充值写卡失败",
             Some(WriteContext::Register) => "注册写卡失败",
@@ -716,6 +725,8 @@ impl GatewayState {
         context: WriteContext,
     ) -> CardWriteRequest {
         self.last_write_context = Some(context);
+        // 保存写入的新余额，以便写卡成功后更新显示
+        self.last_written_balance_cents = Some(card_data.balance_cents);
 
         // 写卡块大小为 16B；当前卡数据格式固定 32B（2 个 block）。
         // 这些断言用于防止未来改动导致写卡长度/块数不一致。
