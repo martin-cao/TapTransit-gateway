@@ -53,6 +53,11 @@ pub fn start_server(
             "wifi_connected": status.wifi_connected,
             "backend_reachable": status.backend_reachable,
             "backend_base_url": status.backend_base_url,
+            "last_card_id": status.last_card_id,
+            "last_balance_cents": status.last_balance_cents,
+            "last_card_data_len": status.last_card_data_len,
+            "last_card_data_prefix_hex": status.last_card_data_prefix_hex,
+            "last_card_data_error": status.last_card_data_error,
             "passenger": {
                 "tone_class": tone_class,
                 "tone_label": tone_label,
@@ -217,6 +222,11 @@ fn status_from_state(state: &Arc<Mutex<GatewayState>>) -> StatusPanel {
             recharge_active: state.recharge_mode.is_some(),
             recharge_amount_cents: state.recharge_mode.as_ref().map(|mode| mode.amount_cents),
             register_active: state.register_mode.is_some(),
+            last_card_id: state.last_card_id.clone(),
+            last_balance_cents: state.last_balance_cents,
+            last_card_data_len: state.last_card_data_len,
+            last_card_data_prefix_hex: state.last_card_data_prefix_hex.clone(),
+            last_card_data_error: state.last_card_data_error.clone(),
         }
     } else {
         // 无法获取锁时返回默认状态
@@ -240,6 +250,11 @@ fn status_from_state(state: &Arc<Mutex<GatewayState>>) -> StatusPanel {
             recharge_active: false,
             recharge_amount_cents: None,
             register_active: false,
+            last_card_id: String::new(),
+            last_balance_cents: None,
+            last_card_data_len: 0,
+            last_card_data_prefix_hex: None,
+            last_card_data_error: None,
         }
     }
 }

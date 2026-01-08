@@ -14,6 +14,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const CARD_CACHE_TTL_MS: u64 = 10 * 60 * 1000;
 const RECHARGE_MODE_TTL_MS: u64 = 60 * 1000;
 const REGISTER_MODE_TTL_MS: u64 = 60 * 1000;
+// 乘客屏消息显示时长（毫秒）。
+// “调高一点”：默认成功提示 2s；错误/写卡失败/注册充值提示 3s。
+const PASSENGER_MSG_TTL_OK_MS: u64 = 2000;
+const PASSENGER_MSG_TTL_ACTION_MS: u64 = 3000;
+const PASSENGER_MSG_TTL_ERROR_MS: u64 = 3000;
 const DEFAULT_REGISTER_BALANCE_CENTS: u32 = 0;
 const MAX_RECHARGE_CENTS: u32 = 20_000;
 
@@ -82,6 +87,9 @@ pub struct GatewayState {
     pub backend_reachable: bool,
     pub backend_base_url: String,
     pub last_card_id: String,
+    pub last_card_data_len: usize,
+    pub last_card_data_prefix_hex: Option<String>,
+    pub last_card_data_error: Option<String>,
     pub last_tap_nonce: u32,
     pub last_message_deadline_ms: u64,
     pub last_passenger_tone: PassengerTone,
@@ -89,6 +97,9 @@ pub struct GatewayState {
     pub last_fare_base: Option<f32>,
     pub last_fare: Option<f32>,
     pub last_fare_label: String,
+    // 最近一次从“卡内数据”读到的余额（不经过后端校验）。
+    // 注意：如果本次刷卡卡内数据无效（读不出/UID 不匹配），这里会是 None。
+    pub last_balance_cents: Option<u32>,
     pub last_tap_type: Option<TapType>,
     pub card_cache: HashMap<String, CachedCardProfile>,
     pub card_state_cache: CardStateSnapshotCache,
@@ -131,6 +142,9 @@ impl GatewayState {
             backend_reachable: false,
             backend_base_url: String::new(),
             last_card_id: String::new(),
+            last_card_data_len: 0,
+            last_card_data_prefix_hex: None,
+            last_card_data_error: None,
             last_tap_nonce: 0,
             last_message_deadline_ms: 0,
             last_passenger_tone: PassengerTone::Normal,
@@ -138,6 +152,7 @@ impl GatewayState {
             last_fare_base: None,
             last_fare: None,
             last_fare_label: "应付".to_string(),
+            last_balance_cents: None,
             last_tap_type: None,
             card_cache: HashMap::new(),
             card_state_cache: CardStateSnapshotCache::new(tap_cache_max),
@@ -281,7 +296,7 @@ impl GatewayState {
         };
         self.last_passenger_tone = PassengerTone::Error;
         self.last_passenger_message = message.to_string();
-        self.last_message_deadline_ms = now_ms.saturating_add(2000);
+        self.last_message_deadline_ms = now_ms.saturating_add(PASSENGER_MSG_TTL_ERROR_MS);
     }
 
     pub fn set_station_by_id(&mut self, station_id: u16) -> bool {
@@ -328,6 +343,13 @@ impl GatewayState {
         self.last_tap_nonce = self.last_tap_nonce.wrapping_add(1);
         let card_id = detected.card_id.clone();
         self.last_card_id = card_id.clone();
+        self.last_card_data_len = detected.card_data.len();
+        self.last_card_data_prefix_hex = if detected.card_data.is_empty() {
+            None
+        } else {
+            Some(hex_prefix(&detected.card_data, 16))
+        };
+        self.last_card_data_error = None;
 
         if !self.debounce.allow(&detected.card_id, now) {
             return self.reject_card("刷卡过快", now_ms);
@@ -335,15 +357,26 @@ impl GatewayState {
 
         let uid = decode_uid_hex(&card_id);
         let mut card_data = if detected.card_data.len() >= CARD_DATA_LEN {
-            CardData::from_bytes(&detected.card_data)
+            match CardData::from_bytes_verbose(&detected.card_data) {
+                Ok(data) => Some(data),
+                Err(err) => {
+                    self.last_card_data_error = Some(err.as_str().to_string());
+                    None
+                }
+            }
         } else {
+            self.last_card_data_error = Some("short_card_data".to_string());
             None
         };
         if let (Some(uid), Some(ref data)) = (uid, card_data.as_ref()) {
             if data.uid != uid {
+                self.last_card_data_error = Some("uid_mismatch".to_string());
                 card_data = None;
             }
         }
+
+        // 余额展示以“读到的卡内数据”为准（不使用后端补全的数据）。
+        self.last_balance_cents = card_data.as_ref().map(|data| data.balance_cents);
 
         if self.blacklist_cache.is_blocked(&detected.card_id) {
             return self.reject_blacklisted(&card_id, card_data, now_ms);
@@ -491,12 +524,13 @@ impl GatewayState {
             }
             _ => {}
         }
+
         self.last_tap_type = Some(tap_type);
 
         if self.last_passenger_tone != PassengerTone::Error {
         self.last_passenger_message = "刷卡成功".to_string();
         }
-        self.last_message_deadline_ms = now_ms.saturating_add(1000);
+        self.last_message_deadline_ms = now_ms.saturating_add(PASSENGER_MSG_TTL_OK_MS);
 
         Decision {
             ack: CardAck::accepted(),
@@ -534,9 +568,11 @@ impl GatewayState {
             gateway_id: self.settings.gateway_id.clone(),
         };
         self.push_card_snapshot(&card_id, &new_data, "register", now_ms);
+        // 注册时本次刷卡不存在“已读出的卡内余额”，保持 None。
+        self.last_balance_cents = None;
         self.last_passenger_tone = PassengerTone::Normal;
         self.last_passenger_message = "注册成功".to_string();
-        self.last_message_deadline_ms = now_ms.saturating_add(2000);
+        self.last_message_deadline_ms = now_ms.saturating_add(PASSENGER_MSG_TTL_ACTION_MS);
         Decision {
             ack: CardAck::accepted(),
             event: None,
@@ -580,6 +616,9 @@ impl GatewayState {
                 data
             }
         };
+        // 充值展示的余额以“刷卡时读到的卡内余额”为准。
+        self.last_balance_cents = Some(card_data.balance_cents);
+
         if card_data.status != CardStatus::Idle {
             return self.reject_card("卡状态异常", now_ms);
         }
@@ -588,7 +627,7 @@ impl GatewayState {
         self.push_card_snapshot(&card_id, &card_data, "recharge", now_ms);
         self.last_passenger_tone = PassengerTone::Normal;
         self.last_passenger_message = "充值成功".to_string();
-        self.last_message_deadline_ms = now_ms.saturating_add(2000);
+        self.last_message_deadline_ms = now_ms.saturating_add(PASSENGER_MSG_TTL_ACTION_MS);
         Decision {
             ack: CardAck::accepted(),
             event: None,
@@ -612,7 +651,7 @@ impl GatewayState {
         self.last_passenger_message = message.to_string();
         self.last_fare_base = None;
         self.last_fare = None;
-        self.last_message_deadline_ms = now_ms.saturating_add(1000);
+        self.last_message_deadline_ms = now_ms.saturating_add(PASSENGER_MSG_TTL_ERROR_MS);
         Decision {
             ack: CardAck::rejected(),
             event: None,
@@ -677,9 +716,16 @@ impl GatewayState {
         context: WriteContext,
     ) -> CardWriteRequest {
         self.last_write_context = Some(context);
+
+        // 写卡块大小为 16B；当前卡数据格式固定 32B（2 个 block）。
+        // 这些断言用于防止未来改动导致写卡长度/块数不一致。
+        debug_assert_eq!(CARD_DATA_BLOCK_COUNT as usize * 16, CARD_DATA_LEN);
+        let bytes = card_data.to_bytes();
+        debug_assert_eq!(bytes.len(), CARD_DATA_LEN);
+
         CardWriteRequest {
             card_id: card_id.to_string(),
-            card_data: card_data.to_bytes().to_vec(),
+            card_data: bytes.to_vec(),
             block_start: CARD_DATA_BLOCK_START,
             block_count: CARD_DATA_BLOCK_COUNT,
         }
@@ -936,6 +982,17 @@ impl GatewayState {
         self.record_seq = self.record_seq.wrapping_add(1);
         format!("{}-{}-{}", self.settings.gateway_id, now, seq)
     }
+}
+
+fn hex_prefix(bytes: &[u8], max_len: usize) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let take_len = core::cmp::min(bytes.len(), max_len);
+    let mut out = String::with_capacity(take_len * 2);
+    for &b in &bytes[..take_len] {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0F) as usize] as char);
+    }
+    out
 }
 
 /// 获取当前毫秒时间戳。

@@ -91,7 +91,13 @@ fn main() {
     // 可选：编译期配置默认线路
     let default_route_id = option_env!("DEFAULT_ROUTE_ID")
         .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(0);
+        // 没有显式配置时，默认尝试拉取线路 1（课程实验的常见默认线路）。
+        .unwrap_or(1);
+
+    // 启动网络上传与 Web 管理界面
+    let _net_handle = net::spawn_network_loop(state.clone(), upload_rx, net_cmd_rx, settings);
+
+    // 启动后立即尝试拉取一次配置（本地空缓存时避免“首刷卡未注册”）。
     if default_route_id > 0 {
         if let Ok(mut state) = state.lock() {
             let direction = state.route_state.direction;
@@ -101,9 +107,6 @@ fn main() {
             route_id: default_route_id,
         });
     }
-
-    // 启动网络上传与 Web 管理界面
-    let _net_handle = net::spawn_network_loop(state.clone(), upload_rx, net_cmd_rx, settings);
     let _server = match web_server::start_server(state.clone(), net_cmd_tx.clone()) {
         Ok(server) => Some(server),
         Err(err) => {

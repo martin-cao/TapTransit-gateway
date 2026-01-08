@@ -4,6 +4,28 @@ pub const CARD_DATA_LEN: usize = 32;
 pub const CARD_DATA_BLOCK_START: u8 = 8;
 pub const CARD_DATA_BLOCK_COUNT: u8 = 2;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CardDataParseError {
+    BadLength,
+    BadMagic,
+    BadVersion,
+    BadUidLen,
+    BadCrc,
+    UnknownStatus,
+}
+
+impl CardDataParseError {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CardDataParseError::BadLength => "bad_length",
+            CardDataParseError::BadMagic => "bad_magic",
+            CardDataParseError::BadVersion => "bad_version",
+            CardDataParseError::BadUidLen => "bad_uid_len",
+            CardDataParseError::BadCrc => "bad_crc",
+            CardDataParseError::UnknownStatus => "unknown_status",
+        }
+    }
+}
 const MAGIC: [u8; 2] = [0x54, 0x54];
 const VERSION: u8 = 0x01;
 const EMPTY_ID: u16 = 0xFFFF;
@@ -69,34 +91,37 @@ impl CardData {
     }
 
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        Self::from_bytes_verbose(data).ok()
+    }
+
+    pub fn from_bytes_verbose(data: &[u8]) -> Result<Self, CardDataParseError> {
         if data.len() < CARD_DATA_LEN {
-            return None;
+            return Err(CardDataParseError::BadLength);
         }
         if data[0..2] != MAGIC {
-            return None;
+            return Err(CardDataParseError::BadMagic);
         }
         if data[2] != VERSION {
-            return None;
+            return Err(CardDataParseError::BadVersion);
         }
         if data[3] != 4 {
-            return None;
+            return Err(CardDataParseError::BadUidLen);
         }
-        let crc = u16::from_le_bytes([data[30], data[31]]);
-        if crc16(&data[..30]) != crc {
-            return None;
+        let stored_crc = u16::from_le_bytes([data[30], data[31]]);
+        let computed_crc = crc16(&data[..30]);
+        if stored_crc != computed_crc {
+            return Err(CardDataParseError::BadCrc);
         }
-
-        let mut uid = [0u8; 4];
-        uid.copy_from_slice(&data[4..8]);
+        let uid = [data[4], data[5], data[6], data[7]];
         let balance_cents = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-        let status = CardStatus::from_u8(data[16])?;
+        let status = CardStatus::from_u8(data[16]).ok_or(CardDataParseError::UnknownStatus)?;
         let entry_station_id = decode_optional_u16(&data[18..20]);
         let last_route_id = decode_optional_u16(&data[20..22]);
         let last_direction = decode_direction(data[22]);
         let last_board_station_id = decode_optional_u16(&data[24..26]);
         let last_alight_station_id = decode_optional_u16(&data[26..28]);
 
-        Some(Self {
+        Ok(Self {
             uid,
             balance_cents,
             status,

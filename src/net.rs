@@ -366,6 +366,12 @@ fn sync_config(state: &Arc<Mutex<GatewayState>>, route_id: u16) -> bool {
     let mut ok = false;
     let base_url = resolve_base_url(state);
 
+    log::info!(
+        "Sync config: route_id={}, base_url='{}'",
+        route_id,
+        base_url
+    );
+
     match fetch_route_config(&base_url, route_id) {
         Ok(config) => {
             if let Ok(mut state) = state.lock() {
@@ -397,6 +403,7 @@ fn sync_config(state: &Arc<Mutex<GatewayState>>, route_id: u16) -> bool {
 /// 请求后端线路配置。
 fn fetch_route_config(base_url: &str, route_id: u16) -> Result<RouteConfig, NetError> {
     let url = format!("{}{}?route_id={}", base_url, CONFIG_PATH, route_id);
+    log::info!("HTTP GET {}", url);
     let mut client = HttpClient::wrap(EspHttpConnection::new(&Default::default())?);
     let headers = [("accept", "application/json")];
     let request = client.request(Method::Get, &url, &headers)?;
@@ -419,6 +426,7 @@ fn fetch_route_config(base_url: &str, route_id: u16) -> Result<RouteConfig, NetE
 /// 请求后端黑名单列表。
 fn fetch_blacklist(base_url: &str) -> Result<Vec<String>, NetError> {
     let url = format!("{}{}?status=blocked", base_url, CARDS_PATH);
+    log::info!("HTTP GET {}", url);
     let mut client = HttpClient::wrap(EspHttpConnection::new(&Default::default())?);
     let headers = [("accept", "application/json")];
     let request = client.request(Method::Get, &url, &headers)?;
@@ -439,6 +447,7 @@ fn fetch_blacklist(base_url: &str) -> Result<Vec<String>, NetError> {
 /// 上报卡片注册信息。
 fn register_card(base_url: &str, payload: CardRegistration) -> Result<(), NetError> {
     let url = format!("{}{}", base_url, CARD_REGISTER_PATH);
+    log::info!("HTTP POST {}", url);
     let body = serde_json::to_string(&payload)?;
     let content_length = body.len().to_string();
     let headers = [

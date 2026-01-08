@@ -37,6 +37,11 @@ pub struct StatusPanel {
     pub recharge_active: bool,
     pub recharge_amount_cents: Option<u32>,
     pub register_active: bool,
+    pub last_card_id: String,
+    pub last_balance_cents: Option<u32>,
+    pub last_card_data_len: usize,
+    pub last_card_data_prefix_hex: Option<String>,
+    pub last_card_data_error: Option<String>,
 }
 
 /// 操作结果（预留扩展）。
@@ -56,6 +61,7 @@ pub fn render_index(status: &StatusPanel) -> String {
     let tone_label = status.passenger_tone.label();
     let standard_fare = format_fare(status.standard_fare);
     let actual_fare = format_fare(status.last_fare);
+    let balance_value = format_cents(status.last_balance_cents);
     let recharge_amount = format_cents(status.recharge_amount_cents);
     let backend_display = if status.backend_base_url.is_empty() {
         "默认"
@@ -96,7 +102,7 @@ pub fn render_index(status: &StatusPanel) -> String {
     html.push_str(".route{font-size:28px;font-weight:700;}"); 
     html.push_str(".station{font-size:38px;font-weight:700;}"); 
     html.push_str(".sub{color:var(--muted);font-size:14px;}");
-    html.push_str(".fare-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;}");
+    html.push_str(".fare-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;}");
     html.push_str(".fare-card{padding:14px;border-radius:16px;border:1px solid var(--stroke);background:rgba(15,23,42,0.6);}"); 
     html.push_str(".fare-title{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;}"); 
     html.push_str(".fare-value{font-size:32px;font-weight:700;margin-top:6px;}"); 
@@ -149,7 +155,19 @@ pub fn render_index(status: &StatusPanel) -> String {
     html.push_str("<div class=\"fare-value\" id=\"fare-actual\">");
     html.push_str(&actual_fare);
     html.push_str("</div></div>");
+    html.push_str("<div class=\"fare-card\">");
+    html.push_str("<div class=\"fare-title\">余额</div>");
+    html.push_str("<div class=\"fare-value\" id=\"last-balance\">");
+    html.push_str(&balance_value);
+    html.push_str("</div></div>");
     html.push_str("</div>");
+    html.push_str("<div class=\"sub\">卡号 <span id=\"last-card-id\">");
+    if status.last_card_id.is_empty() {
+        html.push_str("—");
+    } else {
+        html.push_str(&status.last_card_id);
+    }
+    html.push_str("</span></div>");
     html.push_str("<div class=\"message\" id=\"passenger-message\">");
     html.push_str(&status.passenger_message);
     html.push_str("</div>");
@@ -272,6 +290,8 @@ pub fn render_index(status: &StatusPanel) -> String {
     html.push_str("el('fare-standard').textContent=formatFare(s.fare.standard);");
     html.push_str("el('fare-actual').textContent=formatFare(s.fare.actual);");
     html.push_str("el('fare-label').textContent=s.fare.label;");
+    html.push_str("el('last-card-id').textContent=s.last_card_id||'—';");
+    html.push_str("el('last-balance').textContent=formatCents(s.last_balance_cents);");
     html.push_str("el('driver-route-id').textContent=s.route_id;");
     html.push_str("el('driver-route-name').textContent=routeName;");
     html.push_str("el('driver-station-name').textContent=s.station_name;");
